@@ -18,6 +18,7 @@
 #include "qrcodegen.h"
 #include "net_transport.h"
 #include "r_draw.h"
+#include <stdio.h>
 #include <stdarg.h>
 
 void SoftwareRenderSortedPolygons(void);
@@ -81,6 +82,8 @@ void StartNetworkThread(void);                              /* 0x487674 */
 void CloseDirectPlaySession(void);                          /* 0x4875CC */
 int IsDirectPlayAvailable(void);                            /* 0x487CD8 */
 void AnimateVehicleGlow(Player *player);                    /* 0x4217F8 */
+extern int g_cmdAutoHost;
+extern int g_cmdAutoJoin;
 extern void RenderBalloonModelForResultsScreen(int xOff, int yOff, int zBase,
                                                int angleA, int angleB, int angleC,
                                                int scaleDivisor,
@@ -4366,6 +4369,10 @@ static void NetDbgDraw(void)
     (void)s_netDbgCount;
 }
 
+/* Wall-clock second of the client's last CHAR_CHANGE broadcast; the lobby
+ * repeats the pick once a second because the packet is unacknowledged. */
+static unsigned int s_charResendSec;
+
 /* NetworkScreen state aliases */
 #define ns_lobbyState      g_resultsState          /* 0x68AFD4 */
 #define ns_setupMode       g_netCharSelectState    /* 0x68AFD0 */
@@ -4894,19 +4901,26 @@ int NetworkScreen(void)
     {
         /* If MatchmakerInit() fails (e.g. compiled-out stub or curl init
          * error), needSignIn starts at 0 so we skip the QR loop and fall
-         * straight through to LAN-only lobby flow. */
+         * straight through to LAN-only lobby flow.
+         * Autohost, autojoin, and direct host IP also bypass the QR sign-in screen. */
+        extern const char *g_cmdHostIP;
         int mmInitOk = MatchmakerInit();
-        int needSignIn = (mmInitOk == 1);
-        NetDbgClear();
-        NetDbgPush("MM INIT %s", mmInitOk ? "OK" : "FAIL");
-        if (needSignIn && MatchmakerLoadToken()) {
-            NetDbgPush("TOKEN LOADED");
-            if (MatchmakerRefreshToken()) {
-                needSignIn = 0;
-                NetDbgPush("TOKEN OK %.20s...", MatchmakerGetToken());
-            }
-            else {
-                NetDbgPush("TOKEN REFRESH FAIL");
+        int needSignIn = 0; /* Always bypass QR code so manual menu entry goes straight to LAN lobby */
+        if (g_cmdAutoHost || g_cmdAutoJoin || g_cmdHostIP != NULL) {
+            needSignIn = 0;
+        }
+        else {
+            NetDbgClear();
+            NetDbgPush("MM INIT %s", mmInitOk ? "OK" : "FAIL");
+            if (needSignIn && MatchmakerLoadToken()) {
+                NetDbgPush("TOKEN LOADED");
+                if (MatchmakerRefreshToken()) {
+                    needSignIn = 0;
+                    NetDbgPush("TOKEN OK %.20s...", MatchmakerGetToken());
+                }
+                else {
+                    NetDbgPush("TOKEN REFRESH FAIL");
+                }
             }
         }
 
@@ -5200,6 +5214,7 @@ int NetworkScreen(void)
     UpdateCDPlayback(5);                                      /* 0x48AB99: track 5 */
 
     /* Fade setup */
+    g_fadeSpeed = 12;
     if (g_fadeState != 0) {                                   /* 0x48AB9E */
         UpdateFade();                                         /* 0x4305D4 */
     }
@@ -5230,23 +5245,8 @@ int NetworkScreen(void)
         }
 
         /* Check for exit (fade to black complete) */
-        if (g_fadeLevel == (int)0xFFFFFF00) {                  /* 0x48ABAC: cmp [0x901C44], 0xFFFFFF00 */
-            ns_lobbyState = 0;                                /* [0x68AFD4] = 0 */
-            /* Save selections for next visit */
-            g_netSavedCharId = (int)(signed short)g_menuPlayer.charId; /* 0x48ABDD */
-            g_netSavedTrackIdx = localTrackIdx;               /* 0x48ABEF */
-            g_netSavedModeIdx = localModeIdx;
-
-            /* Copy lobby text buffer back to player config area */
-            {
-                int *dst = (int *)((char *)&g_playerBase[0] + 0x4B0);
-                for (int i = 0; i < 16; i++)
-                    dst[i] = g_portraitTextBuffer[i];
-            }
-
-            UpnpClosePort(NET_PORT_DEFAULT);
-            MatchmakerClearSession();
-            return g_screenResult;                            /* 0x48AC1F: eax = [0x925418] */
+        if (g_fadeLevel <= -256) {
+            goto exit_network_screen;
         }
 
         /* Read input */
@@ -5257,6 +5257,13 @@ int NetworkScreen(void)
          * are processed during the lobby. Binary's recv thread handled
          * this; our thread enqueues but the main thread must dispatch. */
         ApplyNetworkPlayerState();
+
+        if (g_netSessionActive != 0) {
+            printf("[NET_DEBUG] NetworkScreen: g_netSessionActive=1, exiting immediately to race_setup!\n");
+            fflush(stdout);
+            g_screenResult = 1;
+            goto exit_network_screen;
+        }
 
         /* If fade active (g_fadeState != 0), skip to render */
         if (g_fadeState != 0) {                               /* 0x48AC33 */
@@ -5272,13 +5279,15 @@ int NetworkScreen(void)
          * the UI matches behaviour. */
         if ((g_inputBits & 1) != 0 || g_diKeyboardState[0x01] != 0) {
             if (firstFrame == 0) {
+                printf("[NET_DEBUG] Esc/Back pressed: exiting to main menu...\n");
+                fflush(stdout);
                 CloseDirectPlaySession();                      /* 0x4875CC */
                 PlaySoundEffect(0, 0, 0);
-                g_fadeState = 2;                               /* fade out */
-                g_screenResult = 0;                            /* SCREEN_BACK */
+                g_screenResult = SCREEN_BACK;                  /* 0 */
+                goto exit_network_screen;
             }
-            firstFrame = 0;
         }
+        firstFrame = 0;
 
         /* Timeout check (elapsed > 180 seconds) */
         if (elapsed > 0xB4) {                                  /* 0x48AC7A: cmp esi, 0xB4 */
@@ -5293,21 +5302,34 @@ int NetworkScreen(void)
 
         /* STATE 0: Provider / Host-Join selection */
         if (g_diKeyboardState[0x3B] && (g_totalFrames & 0x1F) == 0) {
-            DebugLog("F1 pressed: lobbyState=%d setupMode=%d connMode=%d gameStarted=%d playerCount=%d\n",
-                     ns_lobbyState, ns_setupMode, ns_connectionMode, g_netGameStarted, g_netPlayerCount);
+            printf("[NET_DEBUG] F1 pressed in State 0: lobbyState=%d setupMode=%d connMode=%d gameStarted=%d playerCount=%d\n",
+                   ns_lobbyState, ns_setupMode, ns_connectionMode, g_netGameStarted, g_netPlayerCount);
+            fflush(stdout);
         }
         if (ns_lobbyState == 0) {                              /* 0x48ACA4 */
             g_netProviderChoice = -1;                          /* [0x92528C] = -1 */
 
             if (ns_connectionMode == 0) {                      /* 0x48ACC3: not yet selected */
-                /* Provider selection — original: F1(0x3B)=IPX, F2(0x3C)=TCP,
-                 * F3=Modem, F4=Serial. Simplified to Host/Join. */
-                if (g_diKeyboardState[0x3B]) {                  /* F1 = Host — 0x675907 */
+                if (g_cmdAutoHost) {
+                    g_cmdAutoHost = 0;
                     g_netProviderChoice = 0;
                     lastTickSec = timeGetTime() / 1000;
                     PlaySoundEffect(2, 0, 0);
                 }
-                if (g_diKeyboardState[0x3C]) {                  /* F2 = Join — 0x675908 */
+                else if (g_cmdAutoJoin) {
+                    g_cmdAutoJoin = 0;
+                    g_netProviderChoice = 1;
+                    lastTickSec = timeGetTime() / 1000;
+                    PlaySoundEffect(2, 0, 0);
+                }
+                /* Provider selection — original: F1(0x3B)=IPX, F2(0x3C)=TCP,
+                 * F3=Modem, F4=Serial. Simplified to Host/Join. */
+                else if (g_diKeyboardState[0x3B]) {                  /* F1 = Host — 0x675907 */
+                    g_netProviderChoice = 0;
+                    lastTickSec = timeGetTime() / 1000;
+                    PlaySoundEffect(2, 0, 0);
+                }
+                else if (g_diKeyboardState[0x3C]) {                  /* F2 = Join — 0x675908 */
                     g_netProviderChoice = 1;
                     lastTickSec = timeGetTime() / 1000;
                     PlaySoundEffect(2, 0, 0);
@@ -5342,7 +5364,8 @@ int NetworkScreen(void)
             }
             if (g_netProviderChoice == 1) {                    /* Join selected */
                 ns_setupMode = 2;                              /* [0x68AFD0] = 2 — join mode */
-                if (MatchmakerHasToken()) {
+                extern const char *g_cmdHostIP;
+                if (MatchmakerHasToken() && g_cmdHostIP == NULL) {
                     int lsOk = MatchmakerListSessions(&g_mmSessionList);
                     DebugLog("Matchmaker: hasToken=1 sessions=%d\n", g_mmSessionList.count);
                     NetDbgPush("LIST %s SESSIONS %d",
@@ -5350,7 +5373,7 @@ int NetworkScreen(void)
                     ns_lobbyState = 3;                         /* picker */
                 }
                 else {
-                    DebugLog("Matchmaker: hasToken=0, falling back to LAN\n");
+                    DebugLog("Matchmaker: hasToken=0 or direct host IP set, falling back to LAN/direct\n");
                     NetDbgPush("NO TOKEN - LAN DISCOVERY");
                     ns_lobbyState = 1;
                 }
@@ -5374,8 +5397,8 @@ int NetworkScreen(void)
             /* Join path: try matchmaker sessions first, then LAN. */
             if (ns_setupMode == 2 && g_resultsUnlockFlag != 0) {
                 int joined = 0;
-                if (MatchmakerHasToken() && g_mmSessionList.count > 0) {
-                    extern const char *g_cmdHostIP;
+                extern const char *g_cmdHostIP;
+                if (MatchmakerHasToken() && g_mmSessionList.count > 0 && g_cmdHostIP == NULL) {
                     g_cmdHostIP = g_mmSessionList.sessions[0].ip_address;
                     joined = JoinNetworkSession(NS_STR_JOIN_SESSION, 0);
                     if (!joined) {
@@ -5501,10 +5524,23 @@ int NetworkScreen(void)
             /* Check if host has enough players to start */
             if (g_netGameStarted == 1) {                             /* 0x48B15F: [0x68ACE4] == 1 */
                 if (g_diKeyboardState[0x3B]) {                  /* F1 — 0x675907 */
+                    printf("[NET_DEBUG] F1 pressed! lobbyState=%d, setupMode=%d, connMode=%d, gameStarted=%d, playerCount=%d\n",
+                           ns_lobbyState, ns_setupMode, ns_connectionMode, g_netGameStarted, g_netPlayerCount);
+                    fflush(stdout);
                     if (ns_connectionMode == 0) {              /* 0x48B17A */
-                        DebugLog("F1 in lobby: gameStarted=%d playerCount=%d\n", g_netGameStarted, g_netPlayerCount);
                         if (g_netPlayerCount >= 2) {           /* host + at least one client */
+                            printf("[NET_DEBUG] Host starting game with %d players! Calling InitNetworkGame()...\n", g_netPlayerCount);
+                            fflush(stdout);
                             InitNetworkGame();                 /* 0x487A38 */
+                            printf("[NET_DEBUG] InitNetworkGame() returned! Setting g_netSessionActive=1, g_screenResult=1, exiting...\n");
+                            fflush(stdout);
+                            PlaySoundEffect(2, 0, 0);
+                            g_netSessionActive = 1;
+                            g_screenResult = 1;
+                            goto exit_network_screen;
+                        } else {
+                            printf("[NET_DEBUG] F1 pressed but g_netPlayerCount (%d) < 2! Cannot start game yet.\n", g_netPlayerCount);
+                            fflush(stdout);
                         }
                         lastTickSec = timeGetTime() / 1000;
                     }
@@ -5517,9 +5553,11 @@ int NetworkScreen(void)
 
             /* Check if multiplayer session is now live */
             if (g_netSessionActive != 0) {                        /* 0x48B1AF */
+                printf("[NET_DEBUG] Detected g_netSessionActive != 0 (%d)! Exiting immediately to race_setup!\n", g_netSessionActive);
+                fflush(stdout);
                 PlaySoundEffect(2, 0, 0);
                 g_screenResult = 1;                            /* success */
-                g_fadeState = 2;                               /* fade out */
+                goto exit_network_screen;
             }
         }
 
@@ -5682,7 +5720,15 @@ skip_text_entry:
 
             if (ns_lobbyState > 1) {
                 EnumNetworkSessions(0);                        /* broadcast change */
+                s_charResendSec = timeGetTime() / 1000;
             }
+        }
+        /* CHAR_CHANGE is one unacknowledged UDP packet. If the host misses
+         * it, the host races us as the default character (issue #13), so
+         * keep repeating the current pick once a second while in the lobby. */
+        else if (ns_lobbyState > 1 && timeGetTime() / 1000 != s_charResendSec) {
+            EnumNetworkSessions(0);
+            s_charResendSec = timeGetTime() / 1000;
         }
 
         /* Incoming player slot handling */
@@ -6132,7 +6178,22 @@ render_frame:
         g_screenFPS = 30;
         g_screenBaseTime = (int)timeGetTime();
     }
-    /* unreachable */
+
+exit_network_screen:
+    ns_lobbyState = 0;
+    g_netSavedCharId = (int)(signed short)g_menuPlayer.charId;
+    g_netSavedTrackIdx = localTrackIdx;
+    g_netSavedModeIdx = localModeIdx;
+    {
+        int *dst = (int *)((char *)&g_playerBase[0] + 0x4B0);
+        for (int i = 0; i < 16; i++)
+            dst[i] = g_portraitTextBuffer[i];
+    }
+    UpnpClosePort(NET_PORT_DEFAULT);
+    MatchmakerClearSession();
+    printf("[NET_DEBUG] NetworkScreen exiting with code %d\n", g_screenResult);
+    fflush(stdout);
+    return g_screenResult;
 }
 
 /**
@@ -6309,6 +6370,7 @@ int NetworkScreenReentry(void)
     g_screenBaseTime = (int)timeGetTime();
     UpdateCDPlayback(5);
 
+    g_fadeSpeed = 12;
     if (g_fadeState != 0) {
         UpdateFade();
     }
@@ -6334,33 +6396,20 @@ int NetworkScreenReentry(void)
             UpdateFade();
         }
 
-        if (g_fadeLevel == (int)0xFFFFFF00) {                  /* 0x48ABAC */
-            ns_lobbyState = 0;                                 /* 0x48ABC0 */
-            /* Save selections for next visit */
-            g_netSavedCharId = (int)(signed short)g_menuPlayer.charId; /* 0x48ABDD */
-            g_netSavedTrackIdx = localTrackIdx;                /* 0x48ABEF */
-            g_netSavedModeIdx = localModeIdx;
-
-            /* Set race globals from lobby selections — 0x48ABF4-0x48AC18.
-             * Re-entry function maps track/mode here so main.c doesn't
-             * need the multiplayer init block to do it. */
-            g_trackId = g_trackIdTable[localTrackIdx];         /* 0x48AC00 */
-            g_raceSubMode = localModeIdx * 3;                  /* 0x48AC18: lea eax,[edx*4]; sub eax,edx */
-
-            /* Copy player config back — 0x48AC1D: rep movsd 0x10 */
-            {
-                int *dst = (int *)((char *)&g_playerBase[0] + 0x4B0);
-                for (int i = 0; i < 16; i++) {
-                    dst[i] = g_portraitTextBuffer[i];
-                }
-            }
-
-            return g_screenResult;                             /* 0x48AC1F: eax = [0x925418] */
+        if (g_fadeLevel <= -256) {
+            goto exit_network_screen_re;
         }
 
         ReadInput();
         NetSynthPadKeys();
         ApplyNetworkPlayerState();
+
+        if (g_netSessionActive != 0) {
+            printf("[NET_DEBUG] NetworkScreenReentry: g_netSessionActive=1, exiting immediately to race_setup!\n");
+            fflush(stdout);
+            g_screenResult = 1;
+            goto exit_network_screen_re;
+        }
 
         if (g_fadeState != 0) {
             goto render_frame_re;
@@ -6368,13 +6417,15 @@ int NetworkScreenReentry(void)
 
         if ((g_inputBits & 1) != 0 || g_diKeyboardState[0x01] != 0) {
             if (firstFrame == 0) {
+                printf("[NET_DEBUG] Esc/Back pressed: exiting to main menu...\n");
+                fflush(stdout);
                 CloseDirectPlaySession();
                 PlaySoundEffect(0, 0, 0);
-                g_fadeState = 2;
-                g_screenResult = 0;
+                g_screenResult = SCREEN_BACK; // 0
+                goto exit_network_screen_re;
             }
-            firstFrame = 0;
         }
+        firstFrame = 0;
 
         if (elapsed > 0xB4) {
             PlaySoundEffect(0, 0, 0);
@@ -6450,6 +6501,10 @@ int NetworkScreenReentry(void)
                     if (ns_connectionMode == 0) {
                         if (g_netPlayerCount >= 2) {           /* host + at least one client */
                             InitNetworkGame();
+                            PlaySoundEffect(2, 0, 0);
+                            g_netSessionActive = 1;
+                            g_screenResult = 1;
+                            goto exit_network_screen_re;
                         }
                         lastTickSec = timeGetTime() / 1000;
                     }
@@ -6463,7 +6518,7 @@ int NetworkScreenReentry(void)
             if (g_netSessionActive != 0) {
                 PlaySoundEffect(2, 0, 0);
                 g_screenResult = 1;
-                g_fadeState = 2;
+                goto exit_network_screen_re;
             }
         }
 
@@ -6602,7 +6657,15 @@ skip_text_entry_re:
             g_netBroadcastCharId = (int)(signed short)g_menuPlayer.charId;
             if (ns_lobbyState > 1) {
                 EnumNetworkSessions(0);
+                s_charResendSec = timeGetTime() / 1000;
             }
+        }
+        /* CHAR_CHANGE is one unacknowledged UDP packet. If the host misses
+         * it, the host races us as the default character (issue #13), so
+         * keep repeating the current pick once a second while in the lobby. */
+        else if (ns_lobbyState > 1 && timeGetTime() / 1000 != s_charResendSec) {
+            EnumNetworkSessions(0);
+            s_charResendSec = timeGetTime() / 1000;
         }
 
         if (g_netLobbyPlayerSlot < 4) {
@@ -6821,7 +6884,25 @@ render_frame_re:
         g_screenFPS = 30;
         g_screenBaseTime = (int)timeGetTime();
     }
-    /* unreachable */
+
+exit_network_screen_re:
+    ns_lobbyState = 0;
+    g_netSavedCharId = (int)(signed short)g_menuPlayer.charId;
+    g_netSavedTrackIdx = localTrackIdx;
+    g_netSavedModeIdx = localModeIdx;
+    g_trackId = g_trackIdTable[localTrackIdx];
+    g_raceSubMode = localModeIdx * 3;
+    {
+        int *dst = (int *)((char *)&g_playerBase[0] + 0x4B0);
+        for (int i = 0; i < 16; i++) {
+            dst[i] = g_portraitTextBuffer[i];
+        }
+    }
+    UpnpClosePort(NET_PORT_DEFAULT);
+    MatchmakerClearSession();
+    printf("[NET_DEBUG] NetworkScreenReentry exiting with code %d\n", g_screenResult);
+    fflush(stdout);
+    return g_screenResult;
 }
 
 /* =====================================================================

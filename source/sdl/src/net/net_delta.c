@@ -3,9 +3,6 @@
 #include <string.h>
 #include <stdint.h>
 
-extern void DeriveGroundState(int posX, int posZ, int *outHeight,
-                              short *outNormX, short *outNormY, short *outNormZ);
-
 #define FLAG_SIGNED  0x01
 #define FLAG_DELTA   0x02
 

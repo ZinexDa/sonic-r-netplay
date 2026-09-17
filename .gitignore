@@ -3,6 +3,7 @@
 *.pdb
 release_dist/
 *.zip
+sonic-r-main-Bugfix-rollup/
 
 # C engine intermediate objects and executables
 source/sdl/build/

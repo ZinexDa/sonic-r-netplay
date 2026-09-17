@@ -174,6 +174,10 @@ static int s_cmdUnlock = 0;
 static int s_cmdFullscreen = 0;
 static int s_cmdPort = -1;
 static char s_cmdUsername[MM_MAX_USERNAME];
+int g_cmdAutoHost = 0;
+int g_cmdAutoJoin = 0;
+static char s_cmdDataDir[512];
+static int s_hasExplicitDataDir = 0;
 
 extern void UpdateFlyoverCamera(Player *player, CamStateEntry *cam, RenderCamera *outStruct,
                                  int *waypointTable, int param5, int vpIdx);
@@ -222,7 +226,8 @@ void InitJoystick(void) {
 int CreateNetworkSession(const char *name, const char *password)
 {
     (void)name; (void)password;
-    if (net_host_start(NET_PORT_DEFAULT) == 0) {
+    uint16_t port = (s_cmdPort > 0) ? (uint16_t)s_cmdPort : NET_PORT_DEFAULT;
+    if (net_host_start(port) == 0) {
         g_currentPlayerIdx = 0;          /* host is slot 0 */
         g_localPlayerIndex = 0;
         g_netPlayerCount = 1;            /* host counts as player 0 */
@@ -240,7 +245,7 @@ int CreateNetworkSession(const char *name, const char *password)
         net_set_slot_name(0, uname);
         net_set_slot_platform(0, MM_PLATFORM, (uint8_t)platform_get_region());
 
-        DebugLog("Network session created (host, port %d)\n", NET_PORT_DEFAULT);
+        DebugLog("Network session created (host, port %d)\n", port);
         return 1;
     }
     DebugLog("CreateNetworkSession failed\n");
@@ -252,6 +257,7 @@ int JoinNetworkSession(const char *name, int enumIdx)
 {
     (void)name; (void)enumIdx;
     char hostIp[64];
+    uint16_t port = (s_cmdPort > 0) ? (uint16_t)s_cmdPort : NET_PORT_DEFAULT;
 
     /* Direct connect via --host IP */
     if (g_cmdHostIP != NULL) {
@@ -266,7 +272,7 @@ int JoinNetworkSession(const char *name, int enumIdx)
         }
     }
 
-    if (net_client_connect(hostIp, NET_PORT_DEFAULT) == 0) {
+    if (net_client_connect(hostIp, port) == 0) {
         /* Send join request so host assigns us a slot.  Payload carries our
          * matchmaker username so the host (and via SLOT_ASSIGN/PEER_NAME, the
          * other clients) can populate the decoration table with real names. */
@@ -286,7 +292,7 @@ int JoinNetworkSession(const char *name, int enumIdx)
         strncpy(joinReq.platform, MM_PLATFORM, sizeof(joinReq.platform) - 1);
         joinReq.region = (uint8_t)platform_get_region();
         net_send_to_host(&joinReq, sizeof(joinReq));
-        DebugLog("Joined session at %s:%d as '%s'\n", hostIp, NET_PORT_DEFAULT, joinReq.name);
+        DebugLog("Joined session at %s:%d as '%s'\n", hostIp, port, joinReq.name);
         return 1;
     }
     DebugLog("JoinNetworkSession: connect failed\n");
@@ -523,12 +529,15 @@ int main(int argc, char *argv[])
     static struct option long_opts[] = {
         {"host", required_argument, NULL, 'h'},
         {"port", required_argument, NULL, 'p'},
+        {"data", required_argument, NULL, 'd'},
         {"unlock", no_argument, NULL, 'u'},
         {"fullscreen", no_argument, NULL, 'f'},
         {"username", required_argument, NULL, 'n'},
+        {"autohost", no_argument, NULL, 'H'},
+        {"autojoin", no_argument, NULL, 'J'},
         {NULL, 0, NULL, 0}};
     int opt;
-    while ((opt = getopt_long(argc, argv, "", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "h:p:d:ufn:HJ", long_opts, NULL)) != -1) {
         switch (opt)
         {
             case 'h':
@@ -538,6 +547,12 @@ int main(int argc, char *argv[])
                 break;
             case 'p':
                 s_cmdPort = atoi(optarg);
+                break;
+            case 'd':
+                strncpy(s_cmdDataDir, optarg, sizeof(s_cmdDataDir) - 1);
+                s_cmdDataDir[sizeof(s_cmdDataDir) - 1] = '\0';
+                dataDir = s_cmdDataDir;
+                s_hasExplicitDataDir = 1;
                 break;
             case 'u':
                 s_cmdUnlock = 1;
@@ -550,31 +565,43 @@ int main(int argc, char *argv[])
                 s_cmdUsername[sizeof(s_cmdUsername) - 1] = '\0';
                 MatchmakerSetFallbackUsername(s_cmdUsername);
                 break;
+            case 'H':
+                g_cmdAutoHost = 1;
+                break;
+            case 'J':
+                g_cmdAutoJoin = 1;
+                break;
         }
     }
     if (optind < argc) {
         dataDir = argv[optind];
+        s_hasExplicitDataDir = 1;
     }
 
     /* Get EXE directory, set as working directory
      * Original: GetModuleFileNameA, strip trailing \\, SetCurrentDirectoryA.
      * Faithful to that, with a dev override: an explicit data-path argument
-     * wins; otherwise chdir to the executable's own directory (so the binary
-     * can sit in the data folder and launch from anywhere, including a
-     * double-click). DC/web have no exe-dir concept, so platform_base_path()
-     * returns NULL there and we fall back to DATA_DIR (/cd, /pc, .). */
-    if (optind < argc) { /* explicit data path wins */
+     * wins; otherwise keep current directory if data files exist there, or
+     * chdir to the executable's own directory. */
+    if (s_hasExplicitDataDir) { /* explicit data path wins */
         if (chdir(dataDir) != 0) {
             fprintf(stderr, "Cannot chdir to data directory: %s\n", dataDir);
             return 1;
         }
     }
     else {
-        const char *base = platform_base_path();
-        const char *target = base ? base : dataDir;
-        if (chdir(target) != 0) {
-            fprintf(stderr, "Cannot chdir to data directory: %s\n", target);
-            return 1;
+        /* Check if game data is already present in the current working directory */
+        FILE *probeCwd = fopen(PATH_GENERAL_BIT, "rb");
+        if (probeCwd != NULL) {
+            fclose(probeCwd);
+        }
+        else {
+            const char *base = platform_base_path();
+            const char *target = base ? base : dataDir;
+            if (chdir(target) != 0) {
+                fprintf(stderr, "Cannot chdir to data directory: %s\n", target);
+                return 1;
+            }
         }
     }
 
@@ -775,6 +802,28 @@ def SONICR_DC /* DC splash screen */
      * here: SCREEN_BACK is 0, so routing one through this would zero the
      * viewport count and skip every per-player init loop downstream. */
     int mpPlayerCount = 0;
+
+    if (g_cmdAutoHost || g_cmdAutoJoin) {
+        if (s_cmdUnlock) {
+            g_gpAllTracksFlag = 1;          /* unlock Radiant Emerald in course select */
+            for (int ui = 0; ui < 10; ui++) {
+                g_charUnlockTable[ui] = 2;
+            }
+            g_allCharsUnlocked = 2;
+            g_superSonicSeed = 0x28;     /* seed char-select default to Super Sonic */
+        }
+        InitCD();
+        ResetInputState();
+        InitOptionStuff();
+        g_trackId = TRACK_NONE;
+        g_netSessionActive = 0;
+        g_isNetworkGame = 0;
+        g_numHumans = 1;
+        g_numViewports = 1;
+        ApplyViewportGeometry();
+        g_numPlayers = 5;
+        goto network_screen_entry;
+    }
 
 title_sequence:
     InitCD();
@@ -983,6 +1032,8 @@ main_menu_loop:
 network_screen_entry:
             g_isNetworkGame = 0;
             screenResult = NetworkScreen();
+            printf("[NET_DEBUG] NetworkScreen exited with code: %d, g_isNetworkGame=%d\n", screenResult, g_isNetworkGame);
+            fflush(stdout);
             if (screenResult == SCREEN_TITLE) {
                 StopCD();
                 goto title_sequence;
@@ -992,6 +1043,8 @@ network_result_dispatch:                                   /* 0x4ce767: network 
                 return 0;
             }
             if (screenResult == SCREEN_BACK) {                   /* 0x4CE77A: test eax; je 0x4CE4FA */
+                printf("[NET_DEBUG] Network dispatch: SCREEN_BACK, returning to main_menu_loop\n");
+                fflush(stdout);
                 goto main_menu_loop;              /* back to main dispatch */
             }
             g_netSessionActive = 1;                /* 0x4CE785 */
@@ -1000,6 +1053,8 @@ network_result_dispatch:                                   /* 0x4ce767: network 
             g_numHumans = 1;                    /* 0x4CE79C */
             g_numViewports = g_netPlayerCount;
             g_numPlayers = g_netPlayerCount;
+            printf("[NET_DEBUG] Network dispatch: proceeding to race_setup with %d players\n", g_netPlayerCount);
+            fflush(stdout);
             goto race_setup;
         }
 
@@ -1131,6 +1186,9 @@ char_select:                                   /* 0x4ce66e */
     /* Race setup */
 
 race_setup:
+    printf("[NET_DEBUG] Entering race_setup: g_netSessionActive=%d, g_isNetworkGame=%d, g_netGameStarted=%d, g_netPlayerCount=%d\n",
+           g_netSessionActive, g_isNetworkGame, g_netGameStarted, g_netPlayerCount);
+    fflush(stdout);
     ApplyViewportGeometry();                       /* 0x4ce985: call 0x4cba28 */
     if (g_netSessionActive == 0) {
         LoadTrackSinglePlayer();
@@ -1245,6 +1303,11 @@ race_setup:
      * before entering the countdown iris. Prevents fast peers from racing
      * while slow peers (DC) are still touching the filesystem. */
     NetLevelSyncBarrier();
+
+    /* Ensure track visibly fades in from black on race entry */
+    g_fadeState = FADE_IN;
+    g_fadeSpeed = 12;
+    g_fadeLevel = -0x100;
 
 race_start:
     g_introCountdownInit = 0xffffffff;

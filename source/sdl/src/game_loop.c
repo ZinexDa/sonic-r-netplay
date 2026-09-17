@@ -21,7 +21,6 @@ extern void SetTitleTextureFile(const char *path);
 extern void InitSceneryTpageA(void);
 extern void InitSceneryTpageB(void);
 extern void RemapCharacterTpages(void); /* FUN_00470460 */
-extern void RemapBalloonTpages(void);   /* 0x00470564 */
 extern void LoadCharacterGouraudTables(void);
 
 extern void R_MarkTextureDirty(int tpage);
@@ -538,7 +537,6 @@ void InitTitleScreen(void)
     LoadTextureSubRect(PATH_EMAP_SONICR, g_tpageParallax2,
                        128, 128, 0, 0);              /* 0x470805: 128×128 env map at (0,0) */
     HackTPageBrightness(g_tpageParallax2, 0, 0, 0x80, 0x80); /* 0x47081d: EAX=[0x625cc4], EDX=0, EBX=0, ECX=0x80, push 0x80 */
-    RemapBalloonTpages();                                /* 0x470836 */
     SetTitleTextureFile(PATH_TITLES_RAW);
     LoadTitleTextureD3D();
     ProcessTpageStates();
@@ -639,7 +637,6 @@ void InitOptionStuff(void)
 
     InitSceneryTpageA();
     InitSceneryTpageB();
-    RemapBalloonTpages();                                /* 0x470c5e */
     RemapCharacterTpages();                              /* remaps character face tpage bytes to
                                                           * g_tpageCharacters / g_tpagePlayfield1 */
     g_menuState = -1;

@@ -279,6 +279,12 @@ int net_send_to_host(const void *data, int len)
 
     ssize_t n = sendto(s_socket, data, (size_t)len, 0,
                         (struct sockaddr *)&s_hostAddr, sizeof(s_hostAddr));
+    uint32_t hdr = (len >= 4) ? rl32u(data) : 0;
+    if (hdr != 0xFF00000F && hdr != 0xFFF0004F) {
+        printf("[NET_DEBUG] net_send_to_host: sent %d bytes (hdr=0x%08X, ret=%d) to host %s:%d\n",
+               len, hdr, (int)n, inet_ntoa(s_hostAddr.sin_addr), ntohs(s_hostAddr.sin_port));
+        fflush(stdout);
+    }
     return (int)n;
 }
 
@@ -288,11 +294,17 @@ int net_broadcast(const void *data, int len)
 
     if (s_isHost) {
         /* Host: send to each connected client (skip slot 0 = self) */
+        uint32_t hdr = (len >= 4) ? rl32u(data) : 0;
         for (int i = 1; i < NET_MAX_PLAYERS; i++) {
             if (!s_playerValid[i]) continue;
-            sendto(s_socket, data, (size_t)len, 0,
+            ssize_t n = sendto(s_socket, data, (size_t)len, 0,
                    (struct sockaddr *)&s_playerAddr[i],
                    sizeof(s_playerAddr[i]));
+            if (hdr != 0xFF00000F && hdr != 0xFFF0004F) {
+                printf("[NET_DEBUG] net_broadcast: sent %d bytes (hdr=0x%08X, ret=%d) to slot %d (%s:%d)\n",
+                       len, hdr, (int)n, i, inet_ntoa(s_playerAddr[i].sin_addr), ntohs(s_playerAddr[i].sin_port));
+                fflush(stdout);
+            }
         }
         return 0;
     } else {
@@ -312,6 +324,12 @@ int net_send_to(int player_slot, const void *data, int len)
     ssize_t n = sendto(s_socket, data, (size_t)len, 0,
                         (struct sockaddr *)&s_playerAddr[player_slot],
                         sizeof(s_playerAddr[player_slot]));
+    uint32_t hdr = (len >= 4) ? rl32u(data) : 0;
+    if (hdr != 0xFF00000F && hdr != 0xFFF0004F) {
+        printf("[NET_DEBUG] net_send_to: sent %d bytes (hdr=0x%08X, ret=%d) to slot %d (%s:%d)\n",
+               len, hdr, (int)n, player_slot, inet_ntoa(s_playerAddr[player_slot].sin_addr), ntohs(s_playerAddr[player_slot].sin_port));
+        fflush(stdout);
+    }
     return (int)n;
 }
 
@@ -339,6 +357,9 @@ int net_recv(void *buf, int maxlen, int *from_slot)
             wl32(_rbuf, NET_DISCOVER_REPLY);
             sendto(s_socket, _rbuf, 4, 0,
                    (struct sockaddr *)&sender, sender_len);
+            printf("[NET_DEBUG] net_recv: host replied to discovery from %s:%d\n",
+                   inet_ntoa(sender.sin_addr), ntohs(sender.sin_port));
+            fflush(stdout);
             return 0;  /* consumed internally, don't pass to game */
         }
     }
@@ -354,6 +375,9 @@ int net_recv(void *buf, int maxlen, int *from_slot)
                 s_playerValid[i] = 1;
                 s_playerCount++;
                 slot = i;
+                printf("[NET_DEBUG] net_recv: registered new player in slot %d from %s:%d (total s_playerCount=%d)\n",
+                       i, inet_ntoa(sender.sin_addr), ntohs(sender.sin_port), s_playerCount);
+                fflush(stdout);
                 fprintf(stderr, "net: player %d joined from %s:%d\n",
                         i, inet_ntoa(sender.sin_addr), ntohs(sender.sin_port));
                 break;
@@ -362,6 +386,12 @@ int net_recv(void *buf, int maxlen, int *from_slot)
     }
 
     if (from_slot) *from_slot = slot;
+    uint32_t recv_hdr = (n >= 4) ? rl32u(buf) : 0;
+    if (recv_hdr != 0xFF00000F && recv_hdr != 0xFFF0004F) {
+        printf("[NET_DEBUG] net_recv: %d bytes (hdr=0x%08X) from %s:%d (slot=%d)\n",
+               (int)n, recv_hdr, inet_ntoa(sender.sin_addr), ntohs(sender.sin_port), slot);
+        fflush(stdout);
+    }
     return (int)n;
 }
 

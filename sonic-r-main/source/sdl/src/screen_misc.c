@@ -4369,6 +4369,10 @@ static void NetDbgDraw(void)
     (void)s_netDbgCount;
 }
 
+/* Wall-clock second of the client's last CHAR_CHANGE broadcast; the lobby
+ * repeats the pick once a second because the packet is unacknowledged. */
+static unsigned int s_charResendSec;
+
 /* NetworkScreen state aliases */
 #define ns_lobbyState      g_resultsState          /* 0x68AFD4 */
 #define ns_setupMode       g_netCharSelectState    /* 0x68AFD0 */
@@ -5716,7 +5720,15 @@ skip_text_entry:
 
             if (ns_lobbyState > 1) {
                 EnumNetworkSessions(0);                        /* broadcast change */
+                s_charResendSec = timeGetTime() / 1000;
             }
+        }
+        /* CHAR_CHANGE is one unacknowledged UDP packet. If the host misses
+         * it, the host races us as the default character (issue #13), so
+         * keep repeating the current pick once a second while in the lobby. */
+        else if (ns_lobbyState > 1 && timeGetTime() / 1000 != s_charResendSec) {
+            EnumNetworkSessions(0);
+            s_charResendSec = timeGetTime() / 1000;
         }
 
         /* Incoming player slot handling */
@@ -6645,7 +6657,15 @@ skip_text_entry_re:
             g_netBroadcastCharId = (int)(signed short)g_menuPlayer.charId;
             if (ns_lobbyState > 1) {
                 EnumNetworkSessions(0);
+                s_charResendSec = timeGetTime() / 1000;
             }
+        }
+        /* CHAR_CHANGE is one unacknowledged UDP packet. If the host misses
+         * it, the host races us as the default character (issue #13), so
+         * keep repeating the current pick once a second while in the lobby. */
+        else if (ns_lobbyState > 1 && timeGetTime() / 1000 != s_charResendSec) {
+            EnumNetworkSessions(0);
+            s_charResendSec = timeGetTime() / 1000;
         }
 
         if (g_netLobbyPlayerSlot < 4) {

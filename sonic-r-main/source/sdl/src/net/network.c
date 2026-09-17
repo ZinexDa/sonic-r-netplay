@@ -316,6 +316,62 @@ static int s_clientKeyframeCountdown;
 
 #define KEYFRAME_INTERVAL 30
 
+/* Protocol version, carried in header bytes 10-11 of NET_MSG_SNAPSHOT and
+ * NET_MSG_CLIENT_INPUT. The v1.0 release wrote those bytes as zero and never
+ * read them, so a peer reporting 0 is v1.0. The wire format itself is
+ * unchanged at version 1; the marker exists so the next change can be
+ * detected instead of silently mis-decoded. */
+#define NET_PROTOCOL_VERSION 1
+static unsigned short s_peerProtoVersion[MAX_PLAYERS];
+static unsigned char  s_peerProtoSeen[MAX_PLAYERS];
+
+void EnumNetworkSessions(int flag);   /* CHAR_CHANGE broadcast, defined below */
+
+/* Apply a character id learned over the network to a slot this machine does
+ * not simulate. charId drives the animation tables; _unk_0x1E0 is what the
+ * renderer draws, and InitPlayerSlot copies it from charId once at level
+ * init, so a change that lands after that would leave the old model on
+ * screen (issue #13). If the slot's frame stream is already live, re-seed it
+ * from the new character's table the way TickPlayerAnimation does on an
+ * animation change, so the cursor never points into the old character's
+ * data. */
+static void net_apply_char_id(int slot, short charId)
+{
+    Player *pl = &g_playerBase[slot];
+
+    if (pl->charId == charId && pl->_unk_0x1E0 == charId) return;
+
+    pl->charId = charId;
+    pl->_unk_0x1E0 = charId;
+
+    if (slot < 10 && g_animDataPtrs[slot] != NULL && g_charAnimTables != NULL) {
+        void **tables = (void **)g_charAnimTables;
+        uintptr_t *animPtrs = (uintptr_t *)tables[charId * 2];
+        int animCount = (int)(uintptr_t)tables[charId * 2 + 1];
+        int animIdx = pl->animId;
+
+        g_animDataPtrs[slot] = NULL;
+        if (animPtrs != NULL && animIdx >= 0 && animIdx < animCount) {
+            uintptr_t frameAddr = animPtrs[animIdx];
+            if (frameAddr == 0 && animIdx + 1 < animCount) {
+                frameAddr = animPtrs[animIdx + 1];
+            }
+            g_animDataPtrs[slot] = (const short *)frameAddr;
+        }
+    }
+}
+
+static void net_note_peer_version(int playerIdx, unsigned int ver)
+{
+    if (playerIdx < 0 || playerIdx >= MAX_PLAYERS) return;
+    if (s_peerProtoSeen[playerIdx] && s_peerProtoVersion[playerIdx] == ver) return;
+    s_peerProtoSeen[playerIdx] = 1;
+    s_peerProtoVersion[playerIdx] = (unsigned short)ver;
+    DebugLog("Net: player %d speaks protocol %u, ours is %u%s\n",
+             playerIdx, ver, (unsigned int)NET_PROTOCOL_VERSION,
+             (ver != NET_PROTOCOL_VERSION) ? " (MISMATCH)" : "");
+}
+
 static void NetSnapshotReset(void)
 {
     int i;
@@ -330,6 +386,8 @@ static void NetSnapshotReset(void)
     }
     s_hostKeyframeCountdown = 0;
     s_clientKeyframeCountdown = 0;
+    memset(s_peerProtoSeen, 0, sizeof(s_peerProtoSeen));
+    memset(s_peerProtoVersion, 0, sizeof(s_peerProtoVersion));
 }
 
 /* Per-player state within a snapshot — matches 0xFFF0002F layout minus 4-byte header */
@@ -508,7 +566,7 @@ static int net_build_snapshot(char *buf, int maxlen)
         wl16(buf + 6, frame);
         buf[8] = count;
         buf[9] = is_keyframe ? 1 : 0;
-        buf[10] = buf[11] = 0;
+        wl16(buf + 10, NET_PROTOCOL_VERSION);
     }
 
     offset = SNAP_HEADER_SIZE;
@@ -546,6 +604,7 @@ static void net_apply_snapshot(const char *buf, int len)
 
     count = (uint8_t)buf[8];
     is_keyframe = (buf[9] & 1);
+    net_note_peer_version(0, rl16u(buf + 10));   /* snapshots come from the host, player 0 */
     if (count > NET_MAX_PLAYERS) count = NET_MAX_PLAYERS;
 
     offset = SNAP_HEADER_SIZE;
@@ -883,7 +942,7 @@ void UpdateNetworkClient(void)
                     wl16(pkt + 6, localInput);
                     pkt[8] = (uint8_t)g_localPlayerIndex;
                     pkt[9] = is_kf ? 1 : 0;
-                    pkt[10] = pkt[11] = 0;
+                    wl16(pkt + 10, NET_PROTOCOL_VERSION);
                     bodyLen = net_delta_encode(
                         &s_deltaSend[g_localPlayerIndex],
                         &g_playerBase[g_localPlayerIndex],
@@ -905,14 +964,16 @@ void UpdateNetworkClient(void)
              *   +0x04 uint16_t seq
              *   +0x06 uint16_t inputBits
              *   +0x08 uint8_t  playerIdx
-             *   +0x09 uint8_t  pad[3]     = 0 */
+             *   +0x09 uint8_t  pad        = 0
+             *   +0x0A uint16_t protocol version */
             {
                 char _ipkt[12];
                 wl32(_ipkt + 0, (uint32_t)NET_MSG_CLIENT_INPUT);
                 wl16(_ipkt + 4, s_clientInputSeq++);
                 wl16(_ipkt + 6, localInput);
                 _ipkt[8] = (uint8_t)g_localPlayerIndex;
-                _ipkt[9] = _ipkt[10] = _ipkt[11] = 0;
+                _ipkt[9] = 0;
+                wl16(_ipkt + 10, NET_PROTOCOL_VERSION);
                 SendNetworkPacket(_ipkt, 12);
             }
 #endif
@@ -1777,10 +1838,10 @@ void ApplyNetworkPlayerState(void)
                                 (int)cid, k);
                         continue;
                     }
-                    g_playerBase[k].charId = cid;
+                    net_apply_char_id(k, cid);
                 }
                 /* Restore local player's own pick */
-                g_playerBase[g_localPlayerIndex].charId = g_menuPlayer.charId;
+                net_apply_char_id(g_localPlayerIndex, g_menuPlayer.charId);
             }
 
             /* Populate decoration table.  Real names should already be in
@@ -1810,6 +1871,11 @@ void ApplyNetworkPlayerState(void)
             printf("[NET_DEBUG] Client: calling InitNetworkGame()...\n");
             fflush(stdout);
             InitNetworkGame();
+
+            /* Last chance for the host to learn our character before its
+             * InitPlayerSlot runs: it keeps draining packets until this ACK
+             * lands, so send the pick again first (issue #13). */
+            EnumNetworkSessions(0);
 
             /* ACK so host stops retransmitting
              * Wire: 4 bytes, int header = NET_MSG_START_ACK */
@@ -1842,7 +1908,7 @@ void ApplyNetworkPlayerState(void)
                 continue;
             }
             if (slot >= 0 && slot < NET_MAX_PLAYERS) {
-                g_playerBase[slot].charId = charId;
+                net_apply_char_id(slot, charId);
                 /* Also update decoration table so host has it for START_GAME */
                 *(int *)(g_netPlayerDecorations + slot * NET_DECO_STRIDE + NET_DECO_LOBBYCHAR) = (int)charId;
 
@@ -1877,6 +1943,7 @@ void ApplyNetworkPlayerState(void)
                 s_netInputBuffer[playerIdx] = inputBits;
                 g_netPlayerRecvd[playerIdx] = 1;
                 s_hostSlotLastRecvMs[playerIdx] = timeGetTime();
+                net_note_peer_version((int)playerIdx, rl16u(buf + 10));
 #if NET_PEER_AUTHORITATIVE
                 if (len > 12) {
                     Player *cpl = &g_playerBase[playerIdx];

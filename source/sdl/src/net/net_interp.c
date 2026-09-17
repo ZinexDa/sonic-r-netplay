@@ -4,6 +4,8 @@
 #include "platform.h"
 #include <stdint.h>
 
+extern void DeriveGroundState(Player *player);   /* ground_collision.c */
+
 typedef struct {
     int     posX, posY, posZ;
     int     anglePitch, angleYaw, angleRoll, pitchCombo;
@@ -77,24 +79,31 @@ void NetInterpApply(void)
 
     for (int i = 0; i < MAX_PLAYERS; i++) {
         if (!s_curr[i].valid) continue;
-        if (!s_prev[i].valid || s_intervalMs[i] == 0) continue;
-
-        /* alpha = (now - currRecv) / interval in Q12.
-         * 0x0000 = show prev, 0x1000 = show curr, up to 0x1800 = extrapolate
-         * 50% past curr (coasts on missed packet instead of freezing). */
-        long long num   = (long long)((int32_t)(now - s_curr[i].recvTimeMs)) << 12;
-        long long alpha = num / (long long)s_intervalMs[i];
-        if (alpha < 0)      alpha = 0;
-        if (alpha > 0x1800) alpha = 0x1800;
-        int a = (int)alpha;
 
         Player *p = &g_playerBase[i];
-        p->posX       = lerp_int    (s_prev[i].posX,       s_curr[i].posX,       a);
-        p->posY       = lerp_int    (s_prev[i].posY,       s_curr[i].posY,       a);
-        p->posZ       = lerp_int    (s_prev[i].posZ,       s_curr[i].posZ,       a);
-        p->angleYaw   = lerp_angle12(s_prev[i].angleYaw,   s_curr[i].angleYaw,   a);
-        p->anglePitch = lerp_angle12(s_prev[i].anglePitch, s_curr[i].anglePitch, a);
-        p->angleRoll  = lerp_angle12(s_prev[i].angleRoll,  s_curr[i].angleRoll,  a);
-        p->pitchCombo = lerp_angle12(s_prev[i].pitchCombo, s_curr[i].pitchCombo, a);
+
+        if (s_prev[i].valid && s_intervalMs[i] != 0) {
+            /* alpha = (now - currRecv) / interval in Q12.
+             * 0x0000 = show prev, 0x1000 = show curr, up to 0x1800 = extrapolate
+             * 50% past curr (coasts on missed packet instead of freezing). */
+            long long num   = (long long)((int32_t)(now - s_curr[i].recvTimeMs)) << 12;
+            long long alpha = num / (long long)s_intervalMs[i];
+            if (alpha < 0)      alpha = 0;
+            if (alpha > 0x1800) alpha = 0x1800;
+            int a = (int)alpha;
+
+            p->posX       = lerp_int    (s_prev[i].posX,       s_curr[i].posX,       a);
+            p->posY       = lerp_int    (s_prev[i].posY,       s_curr[i].posY,       a);
+            p->posZ       = lerp_int    (s_prev[i].posZ,       s_curr[i].posZ,       a);
+            p->angleYaw   = lerp_angle12(s_prev[i].angleYaw,   s_curr[i].angleYaw,   a);
+            p->anglePitch = lerp_angle12(s_prev[i].anglePitch, s_curr[i].anglePitch, a);
+            p->angleRoll  = lerp_angle12(s_prev[i].angleRoll,  s_curr[i].angleRoll,  a);
+            p->pitchCombo = lerp_angle12(s_prev[i].pitchCombo, s_curr[i].pitchCombo, a);
+        }
+
+        /* Only players with a snapshot are remote. Their physics never runs
+         * here, so rebuild groundHeight and the surface normal from the
+         * position just written — the shadow and footprints read them. */
+        DeriveGroundState(p);
     }
 }

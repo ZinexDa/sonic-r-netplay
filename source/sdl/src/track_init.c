@@ -30,7 +30,6 @@ void InitPlayerSlot(Player *player, int charId);  /* 0x485120 */
 void InitRaceState(void);                   /* 0x4751E4 */
 void InitFarClipAndFog(int farClip);        /* 0x4704F0 */
 void RemapCharacterTpages(void);            /* 0x470460 */
-void RemapBalloonTpages(void);              /* 0x470564 */
 void InitSoftwareTerrain(void);             /* 0x46F6B4 */
 void InitTrackAnimObjects(void);            /* 0x47FA64 */
 extern int g_tpageDirty;
@@ -929,20 +928,6 @@ void RemapCharacterTpages(void)
         i++;
         ptypePtr++;
     } while (i < g_modelPolygonCount);
-}
-
-/**
- * RemapBalloonTpages — 0x00470564 — 26 bytes
- * Points all 34 balloon faces at the character texture page. The model ships
- * with tpage 4 baked in; each track puts PLAYER00 in a different slot, so the
- * binary rewrites the byte right after the slot assignments.
- */
-void RemapBalloonTpages(void)
-{
-    unsigned char *face = (unsigned char *)s_balloonModelPoly;      /* 0x509640 */
-    for (int i = 0; i < 34; i++) {
-        face[i * 0x30 + 0x28] = (unsigned char)g_tpageCharacters;   /* 0x470570 */
-    }
 }
 
 /**

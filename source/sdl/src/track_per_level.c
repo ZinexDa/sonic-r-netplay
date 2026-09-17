@@ -75,7 +75,6 @@ void LoadParallaxFactory(void);         /* FUN_004745D0 */
 void SetWeatherTint(void);            /* FUN_004E0758 — sets g_weatherR/G/B from conditions */
 
 extern void InitTrackObjectModes(void);  /* 0x0047256C — sets mode 2 for rotatable decorations */
-extern void RemapBalloonTpages(void);    /* 0x00470564 — balloon faces -> g_tpageCharacters */
 
 static const char *s_trackBinPaths[] = {
     NULL,
@@ -293,7 +292,6 @@ void InitIsland(void)
     g_worldBoundsD = 631.408447265625f;
     g_worldBoundsE = -564.6244506835938f;
 
-    RemapBalloonTpages();                       /* 0x470564 */
     LoadTrackData();
     InitTrackObjectModes();                      /* 0x473790 */
 }
@@ -381,7 +379,6 @@ void InitCity(void)
     g_worldBoundsD = 631.408447265625f;
     g_worldBoundsE = -564.722412109375f;
 
-    RemapBalloonTpages();                       /* 0x470564 */
     LoadTrackData();
     InitTrackObjectModes();
 }
@@ -468,7 +465,6 @@ void InitRuin(void)
     g_worldBoundsD = 192.3921661376953f;
     g_worldBoundsE = -279.3009033203125f;
 
-    RemapBalloonTpages();                       /* 0x470564 */
     LoadTrackData();
     InitTrackObjectModes();
 }
@@ -555,7 +551,6 @@ void InitFactory(void)
     g_worldBoundsD = 445.75390625f;
     g_worldBoundsE = -472.4747009277344f;
 
-    RemapBalloonTpages();                       /* 0x470564 */
     LoadTrackData();
     InitTrackObjectModes();
 }
@@ -622,7 +617,6 @@ void InitEmerald(void)
 
     LoadTrackGeometry();
 
-    RemapBalloonTpages();                       /* 0x470564 */
     LoadTrackData();
     InitTrackObjectModes();
 }

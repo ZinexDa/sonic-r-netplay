@@ -825,25 +825,42 @@ int IsOnTrackSurface(float x, float z)
     return 1;  /* on-track */
 }
 
-void DeriveGroundState(int posX, int posZ, int *outHeight,
-                       short *outNormX, short *outNormY, short *outNormZ)
+/* Receive-side ground state for a REMOTE network player.
+ *
+ * The wire carries posX/Y/Z, groundedFlag, loopMode and collisionLayer but
+ * not groundHeight or the surface normal, and GroundCollision never runs for
+ * a player this machine doesn't simulate. Without this both fields keep their
+ * spawn values for the whole race, so the shadow and footprints draw at
+ * start-grid height wherever the player really is (issue #12).
+ *
+ * Same surface walk as GroundCollision, with the sender's posY standing in
+ * for its airborne tests, and the acceptance rule for a surface on a higher
+ * collision layer reduced to the proximity test that every branch of
+ * GroundCollision ends in. Reads only fields that arrive over the wire and
+ * writes only groundHeight and surfNorm*, so nothing received is clobbered. */
+void DeriveGroundState(Player *player)
 {
-    int bestHeight = 0;
-    int bestFaceIdx = -1;
-
-    *outHeight = 0;
-    *outNormX = 0;
-    *outNormY = -0x1000;
-    *outNormZ = 0;
-
     if (g_trackSurfaceData == NULL || g_terGridIndex == NULL || g_terGridData == NULL) {
         return;
     }
 
-    int cellX = ((posX >> 12) - g_aiGridOriginX) / g_aiGridCellWidth;
-    int cellZ = ((posZ >> 12) - g_aiGridOriginZ) / g_aiGridCellHeight;
-    if (cellX < 0 || cellZ < 0 || cellX > 0x1F || cellZ > 0x1F) {
+    /* Sender on a loop: UpdatePlayerMovement pins groundHeight to posY. */
+    if (player->loopMode != 0) {
+        player->groundHeight = player->posY;
         return;
+    }
+
+    int px = player->posX;
+    int py = player->posY;
+    int pz = player->posZ;
+
+    int bestHeight = 0;
+    int bestFaceIdx = -1;
+
+    int cellX = ((px >> 12) - g_aiGridOriginX) / g_aiGridCellWidth;
+    int cellZ = ((pz >> 12) - g_aiGridOriginZ) / g_aiGridCellHeight;
+    if (cellX < 0 || cellZ < 0 || cellX > 0x1F || cellZ > 0x1F) {
+        goto done;
     }
 
     short *gridIdx = (short *)g_terGridIndex;
@@ -851,38 +868,98 @@ void DeriveGroundState(int posX, int posZ, int *outHeight,
     short *polyList = gridData + gridIdx[cellZ * 0x20 + cellX];
 
     if (*polyList == (short)0xFFFF) {
-        return;
+        goto done;
     }
 
     do {
-        unsigned short entry = *polyList++;
-        if ((entry & 0x4000) != 0) {
+        unsigned short entry = *polyList;
+        unsigned int surfIdx = (unsigned int)(short)entry;
+
+        /* Skip wall polygons (bit 14 set) */
+        if ((surfIdx & 0x4000) != 0) {
+            polyList++;
             continue;
         }
 
-        int surfIdx = (short)entry & 0xFFF;
-        TerSurface *surf = (TerSurface *)g_trackSurfaceData + surfIdx;
-        int sx = (posX >> 12) - surf->centerX;
-        int sz = (posZ >> 12) - surf->centerZ;
+        /* Track 3 (Regal Ruin): skip pyramid ground surfaces when opened. */
+        if (g_trackId == TRACK_REGAL_RUIN) {
+            int si = surfIdx & 0xFFF;
+            TerItemState *ist = (TerItemState *)g_itemStateTable;
+            if (ist[0].activeFlag == 0) {
+                if (si > 0x188 && si < 0x18E) {
+                    polyList++;
+                    continue;
+                }
+            }
+            if (ist[1].activeFlag == 0) {
+                if (si == 0x3F || si == 0x103) {
+                    polyList++;
+                    continue;
+                }
+                if (si > 0x12E && si < 0x132) {
+                    polyList++;
+                    continue;
+                }
+            }
+        }
+
+        TerSurface *surf = (TerSurface *)g_trackSurfaceData + (surfIdx & 0xFFF);
+        int sx = (px >> 12) - surf->centerX;
+        int sz = (pz >> 12) - surf->centerZ;
         if (sx * sx + sz * sz >= surf->radiusSq) {
+            polyList++;
             continue;
         }
-        if (!PointInPolygon(posX >> 12, posZ >> 12, surfIdx)) {
+
+        if (!PointInPolygon(px, pz, surfIdx & 0xFFF)) {
+            polyList++;
             continue;
         }
-        int h = InterpolateGroundHeight(posX >> 12, posZ >> 12, surfIdx, s_hitEdgeIdx);
-        if (h <= bestHeight) {
-            bestHeight = h;
+
+        int groundY = InterpolateGroundHeight(px, pz, surfIdx & 0xFFF, s_hitEdgeIdx);
+
+        if (player->collisionLayer < s_hitSurfaceLayer) {
+            /* Track 2 (Radical City): skip surfaces 0x1F5-0x1F8. */
+            if (g_trackId == TRACK_RADICAL_CITY) {
+                int si = surfIdx & 0xFFF;
+                if (si >= 0x1F5 && si <= 0x1F8) {
+                    polyList++;
+                    continue;
+                }
+            }
+            if (py - groundY >= 0x40000) {
+                polyList++;
+                continue;
+            }
+        }
+
+        if (groundY <= bestHeight) {
+            bestHeight = groundY;
             bestFaceIdx = s_hitEdgeIdx + surf->faceBase;
         }
+
+        polyList++;
     } while ((*(polyList - 1) & 0x8000) == 0);
 
-    *outHeight = bestHeight;
+done:
+    /* Grounded sender: ApplyGroundedY made its posY equal groundHeight. */
+    if (player->groundedFlag != 0) {
+        player->groundHeight = py;
+    }
+    else {
+        player->groundHeight = bestHeight;
+    }
 
+    /* Normal of the accepted face, as SurfaceNormalPhysics stores it. */
     if (bestFaceIdx >= 0) {
         TerFace *face = &((TerFace *)g_terFaceTable)[bestFaceIdx];
-        *outNormX = face->normalX;
-        *outNormY = face->normalY;
-        *outNormZ = face->normalZ;
+        player->surfNormX = face->normalX;
+        player->surfNormY = face->normalY;
+        player->surfNormZ = face->normalZ;
+    }
+    else {
+        player->surfNormX = 0;
+        player->surfNormY = -0x1000;
+        player->surfNormZ = 0;
     }
 }
