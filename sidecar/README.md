@@ -41,11 +41,11 @@ cargo run -p sidecar -- list
 ### Join a Server
 
 ```bash
-# Automatically discovers and joins the first active server (using custom game port)
-cargo run -p sidecar -- join --game-port 5030
+# Automatically discovers and joins the first active server (default game port 5029)
+cargo run -p sidecar -- join
 
 # Or join a specific server ID
-cargo run -p sidecar -- join --game-port 5030 <SERVER_ID>
+cargo run -p sidecar -- join <SERVER_ID>
 ```
 
 ### CLI Arguments & Options
@@ -54,17 +54,17 @@ cargo run -p sidecar -- join --game-port 5030 <SERVER_ID>
 - `--hub-udp-addr <IP:PORT>`: Mini-STUN UDP endpoint address (default: `127.0.0.1:9000`).
 - `--game-port <PORT>`: High-level game port setting.
   - In **host** mode, sets `--target-game-port` (the port where the game server listens, default: `5029`).
-  - In **join** mode, sets `--proxy-port` (the local port the sidecar proxy binds to, default: `5030` or `5029`).
+  - In **join** mode, sets `--proxy-port` (the local port the sidecar proxy binds to, default: `5029`).
 - `--target-game-port <PORT>`: (Host mode) The local port where the game server listens for incoming connections (default: `5029`).
 - `--proxy-port <PORT>`: The local loopback port on `127.0.0.1` that the sidecar binds to.
   - In **host** mode, defaults to `0` (ephemeral port) so the game server can bind `5029` exclusively without port collision.
-  - In **join** mode, defaults to the game port (default: `5030` or `5029`).
+  - In **join** mode, defaults to the game port (default: `5029`).
 
 ### Environment Variables
 
 - `GAME_PORT`: Default local game port if `--game-port` is not specified on CLI.
 - `TARGET_GAME_PORT`: Default target game port for host mode (default: `5029`).
-- `PROXY_PORT`: Default bind port for local sidecar proxy (`0` for host, `5030` for join).
+- `PROXY_PORT`: Default bind port for local sidecar proxy (`0` for host, `5029` for join).
 - `HUB_WS_URL`: WebSocket signaling endpoint (default: `ws://127.0.0.1:8080/ws`).
 - `HUB_UDP_ADDR`: Mini-STUN UDP endpoint (default: `127.0.0.1:9000`).
 - `SIDECAR_FORCE_RELAY`: Set to `1` or `true` to immediately bypass direct P2P hole punching and invoke the UDP relay fallback path (useful for testing).
@@ -96,8 +96,8 @@ The `sidecar` exposes a transparent UDP proxy on `127.0.0.1`:
    - When `sonicr.exe` responds to the datagram's origin (the sidecar's ephemeral port), sidecar encapsulates it and forwards it back through the tunnel.
 
 2. **Join Mode (Active Client)**:
-   - The client sidecar binds `127.0.0.1:5030` (`--game-port 5030`).
-   - The game client (`sonicr.exe --host 127.0.0.1 --port 5030`) initiates communication by sending its join request to the client sidecar proxy.
+   - The client sidecar binds `127.0.0.1:5029` (`--game-port 5029`).
+   - The game client (`sonicr.exe --host 127.0.0.1 --port 5029`) initiates communication by sending its join request to the client sidecar proxy.
    - The proxy dynamically learns the client game's ephemeral socket address, forwards the packet through the tunnel, and routes replies back to the client game.
 
 3. **Seamless Relay Switching**:

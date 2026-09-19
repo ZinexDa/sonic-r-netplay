@@ -289,7 +289,13 @@ async fn test_relay_transition_during_game_session() {
     game_client.send_to(b"RELAY_PACKET", proxy_game_addr).await.unwrap();
 
     // Now the packet must arrive at relay_mock_sock, NOT direct_peer_sock!
-    let (n2, from2) = relay_mock_sock.recv_from(&mut buf).await.unwrap();
+    // Loop to consume any initial relay keepalive ping that proxy sends upon relay switch
+    let (n2, from2) = loop {
+        let (n, from) = relay_mock_sock.recv_from(&mut buf).await.unwrap();
+        if buf[16] == MSG_TYPE_GAME_DATA {
+            break (n, from);
+        }
+    };
     assert_eq!(from2, tunnel_addr);
     assert_eq!(&buf[17..n2], b"RELAY_PACKET");
 

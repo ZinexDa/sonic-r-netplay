@@ -26,6 +26,22 @@
 
 extern void platform_pump_events(void);
 
+void net_sidecar_stop(void)
+{
+#ifdef _WIN32
+    typedef void (*netplay_stop_fn)(void);
+    HMODULE h = GetModuleHandleA("sidecar.dll");
+    if (h) {
+        netplay_stop_fn fn = (netplay_stop_fn)GetProcAddress(h, "netplay_stop");
+        if (fn) fn();
+    }
+#elif !defined(SONICR_DC)
+    typedef void (*netplay_stop_fn)(void);
+    netplay_stop_fn fn = (netplay_stop_fn)dlsym(RTLD_DEFAULT, "netplay_stop");
+    if (fn) fn();
+#endif
+}
+
 /* =====================================================================
  * Receive thread — packet ring buffer
  *
@@ -1053,6 +1069,7 @@ void CloseDirectPlaySession(void)
 
     NetRecvThread_Stop();
     net_close();
+    net_sidecar_stop();
     DebugLog("Session Closed & Player Destroyed.\n");
 }
 

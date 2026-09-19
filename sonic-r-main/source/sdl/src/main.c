@@ -527,7 +527,7 @@ int main(int argc, char *argv[])
     const char *dataDir = DATA_DIR;
 
     static struct option long_opts[] = {
-        {"host", required_argument, NULL, 'h'},
+        {"host", optional_argument, NULL, 'h'},
         {"port", required_argument, NULL, 'p'},
         {"data", required_argument, NULL, 'd'},
         {"unlock", no_argument, NULL, 'u'},
@@ -537,13 +537,22 @@ int main(int argc, char *argv[])
         {"autojoin", no_argument, NULL, 'J'},
         {NULL, 0, NULL, 0}};
     int opt;
-    while ((opt = getopt_long(argc, argv, "h:p:d:ufn:HJ", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "h::p:d:ufn:HJ", long_opts, NULL)) != -1) {
         switch (opt)
         {
             case 'h':
-                strncpy(s_hostIPArg, optarg, sizeof(s_hostIPArg) - 1);
-                s_hostIPArg[sizeof(s_hostIPArg) - 1] = '\0';
-                g_cmdHostIP = s_hostIPArg;
+                if (optarg != NULL && optarg[0] != '\0' && optarg[0] != '-') {
+                    strncpy(s_hostIPArg, optarg, sizeof(s_hostIPArg) - 1);
+                    s_hostIPArg[sizeof(s_hostIPArg) - 1] = '\0';
+                    g_cmdHostIP = s_hostIPArg;
+                } else if (optind < argc && argv[optind] != NULL && argv[optind][0] != '-') {
+                    strncpy(s_hostIPArg, argv[optind], sizeof(s_hostIPArg) - 1);
+                    s_hostIPArg[sizeof(s_hostIPArg) - 1] = '\0';
+                    g_cmdHostIP = s_hostIPArg;
+                    optind++;
+                } else {
+                    g_cmdAutoHost = 1;
+                }
                 break;
             case 'p':
                 s_cmdPort = atoi(optarg);
@@ -1035,14 +1044,17 @@ network_screen_entry:
             printf("[NET_DEBUG] NetworkScreen exited with code: %d, g_isNetworkGame=%d\n", screenResult, g_isNetworkGame);
             fflush(stdout);
             if (screenResult == SCREEN_TITLE) {
+                CloseDirectPlaySession();
                 StopCD();
                 goto title_sequence;
             }
 network_result_dispatch:                                   /* 0x4ce767: network result dispatch (also reached from post-race) */
             if (screenResult == SCREEN_QUIT) {
+                CloseDirectPlaySession();
                 return 0;
             }
             if (screenResult == SCREEN_BACK) {                   /* 0x4CE77A: test eax; je 0x4CE4FA */
+                CloseDirectPlaySession();
                 printf("[NET_DEBUG] Network dispatch: SCREEN_BACK, returning to main_menu_loop\n");
                 fflush(stdout);
                 goto main_menu_loop;              /* back to main dispatch */

@@ -181,7 +181,7 @@ fn parse_args(args: &[String]) -> CliConfig {
             .or(explicit_game_port)
             .or(env_proxy_port)
             .or(env_game_port)
-            .unwrap_or(5030);
+            .unwrap_or(5029);
         let target_game_addr = explicit_target_game_port
             .or(env_target_game_port)
             .map(|p| SocketAddr::from(([127, 0, 0, 1], p)));
@@ -304,6 +304,24 @@ mod tests {
             SidecarMode::Join { server_id, bind_port, .. } => {
                 assert_eq!(server_id, Some(uuid_str.parse().unwrap()));
                 assert_eq!(bind_port, 5030);
+            }
+            _ => panic!("Expected Join mode"),
+        }
+    }
+
+    #[test]
+    fn test_parse_args_join_default_port() {
+        let uuid_str = "11111111-2222-3333-4444-555555555555";
+        let args = vec![
+            "sidecar".to_string(),
+            "join".to_string(),
+            uuid_str.to_string(),
+        ];
+        let cfg = parse_args(&args);
+        match cfg.mode {
+            SidecarMode::Join { server_id, bind_port, .. } => {
+                assert_eq!(server_id, Some(uuid_str.parse().unwrap()));
+                assert_eq!(bind_port, 5029);
             }
             _ => panic!("Expected Join mode"),
         }

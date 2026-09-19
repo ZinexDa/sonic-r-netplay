@@ -428,6 +428,41 @@ static unsigned char SDLScancodeToDIK(SDL_Scancode sc)
  * Platform API implementation
  * ===================================================================== */
 
+/* =====================================================================
+ * Game Controller DB Mapping Loader
+ * ===================================================================== */
+static void LoadGameControllerMappings(void)
+{
+    static int s_mappingsLoaded = 0;
+    if (s_mappingsLoaded) {
+        return;
+    }
+    int total = 0;
+    const char *base = platform_base_path();
+    if (base && *base) {
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/gamecontrollerdb.txt", base);
+        int n = SDL_GameControllerAddMappingsFromFile(path);
+        if (n > 0) {
+            fprintf(stderr, "Loaded %d controller mappings from %s\n", n, path);
+            total += n;
+        }
+    }
+    int n = SDL_GameControllerAddMappingsFromFile("gamecontrollerdb.txt");
+    if (n > 0) {
+        fprintf(stderr, "Loaded %d controller mappings from gamecontrollerdb.txt\n", n);
+        total += n;
+    }
+    if (total == 0) {
+        n = SDL_GameControllerAddMappingsFromFile("../gamecontrollerdb.txt");
+        if (n > 0) {
+            fprintf(stderr, "Loaded %d controller mappings from ../gamecontrollerdb.txt\n", n);
+            total += n;
+        }
+    }
+    s_mappingsLoaded = 1;
+}
+
 int platform_init(int width, int height, int fullscreen, const char *title)
 {
     s_fbWidth = width;
@@ -448,6 +483,10 @@ int platform_init(int width, int height, int fullscreen, const char *title)
         fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
         return -1;
     }
+    if (!SDL_WasInit(SDL_INIT_GAMECONTROLLER)) {
+        SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER);
+    }
+    LoadGameControllerMappings();
     SDL_StopTextInput();  /* disable macOS IME composition overlay */
 
     if (Mix_OpenAudio(44100, MIX_DEFAULT_FORMAT, 2, 2048) < 0) {
@@ -671,6 +710,7 @@ void platform_pump_events(void)
 
 int platform_init_gamepads(void)
 {
+    LoadGameControllerMappings();
     /* Open anything already connected at startup. Hotplug arrivals go through
      * the same gamepad_open() from the JOYDEVICEADDED handler. */
     int n = SDL_NumJoysticks();

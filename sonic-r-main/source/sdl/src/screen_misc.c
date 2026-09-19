@@ -6191,6 +6191,11 @@ exit_network_screen:
     }
     UpnpClosePort(NET_PORT_DEFAULT);
     MatchmakerClearSession();
+    if (g_screenResult != 1) {
+        printf("[NET_DEBUG] NetworkScreen: non-race exit (%d), closing session & stopping sidecar\n", g_screenResult);
+        fflush(stdout);
+        CloseDirectPlaySession();
+    }
     printf("[NET_DEBUG] NetworkScreen exiting with code %d\n", g_screenResult);
     fflush(stdout);
     return g_screenResult;
@@ -6900,6 +6905,11 @@ exit_network_screen_re:
     }
     UpnpClosePort(NET_PORT_DEFAULT);
     MatchmakerClearSession();
+    if (g_screenResult != 1) {
+        printf("[NET_DEBUG] NetworkScreenReentry: non-race exit (%d), closing session & stopping sidecar\n", g_screenResult);
+        fflush(stdout);
+        CloseDirectPlaySession();
+    }
     printf("[NET_DEBUG] NetworkScreenReentry exiting with code %d\n", g_screenResult);
     fflush(stdout);
     return g_screenResult;

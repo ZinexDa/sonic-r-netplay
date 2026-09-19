@@ -1818,7 +1818,7 @@ checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
 name = "hub"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "axum",
  "dashmap",
@@ -2116,7 +2116,7 @@ checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
 name = "launcher"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "eframe",
  "egui",
@@ -2824,7 +2824,7 @@ checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
 
 [[package]]
 name = "proto"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "serde",
  "uuid",
@@ -3285,7 +3285,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "sidecar"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "futures-util",
  "proto",

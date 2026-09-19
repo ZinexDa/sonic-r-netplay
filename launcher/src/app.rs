@@ -13,6 +13,7 @@ use std::{net::SocketAddr, path::PathBuf, time::Duration};
 use tokio::runtime::Handle;
 
 const DEFAULT_HUB_ADDR: &str = "127.0.0.1:8080";
+pub const DEFAULT_NETPLAY_PORT: u16 = 5029;
 
 pub struct LauncherApp {
     tokio_handle: Handle,
@@ -151,7 +152,7 @@ impl LauncherApp {
         self.is_session_active = true;
         self.is_hosting = true;
         self.status_message = "Starting host session...".to_string();
-        self.launch_game_process(true, 5029, None);
+        self.launch_game_process(true, DEFAULT_NETPLAY_PORT, None);
 
         let err_tx = event_tx.clone();
         let task = self.tokio_handle.spawn(async move {
@@ -161,7 +162,7 @@ impl LauncherApp {
                 hub_udp_addr,
                 name,
                 bind_port: 0,
-                target_game_addr: Some(SocketAddr::from(([127, 0, 0, 1], 5029))),
+                target_game_addr: Some(SocketAddr::from(([127, 0, 0, 1], DEFAULT_NETPLAY_PORT))),
             };
             if let Err(err) = sidecar::runner::run_host_session(config, Some(event_tx)).await {
                 tracing::error!(%err, "Host session runner terminated with error");
@@ -195,7 +196,7 @@ impl LauncherApp {
                 hub_ws_url,
                 hub_udp_addr,
                 server_id: Some(server_id),
-                bind_port: 5030,
+                bind_port: DEFAULT_NETPLAY_PORT,
                 target_game_addr: None,
             };
             if let Err(err) = sidecar::runner::run_join_session(config, Some(event_tx)).await {
@@ -272,7 +273,7 @@ impl LauncherApp {
                 self.status_message =
                     format!("Host session registered (ID: {server_id}). Waiting for players...");
                 if self.is_hosting && self.game_child.is_none() {
-                    self.launch_game_process(true, 5029, None);
+                    self.launch_game_process(true, DEFAULT_NETPLAY_PORT, None);
                 }
             }
             RunnerEvent::PeerCandidateReceived { peer_addr, .. } => {
