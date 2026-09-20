@@ -23,8 +23,73 @@
 #include <string.h>
 #include <unistd.h>
 #include "endian_util.h"
+#ifndef SONICR_DC
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
+#endif
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
+#include "platform.h"
+
+/* Client: 1 once we've received SLOT_ASSIGN from the host. Gates client→host
+ * sends so we don't spray pad packets at a host that hasn't accepted us. */
+static int s_haveSlotAssign = 0;
+static DWORD s_lastJoinReqMs = 0;
+
+/* Helper to cleanly signal the Rust netplay sidecar to stop when session ends */
+void net_sidecar_stop(void)
+{
+    s_haveSlotAssign = 0;
+    s_lastJoinReqMs = 0;
+#ifdef _WIN32
+    typedef void (*netplay_stop_fn)(void);
+    HMODULE h = GetModuleHandleA("sidecar.dll");
+    if (h) {
+        netplay_stop_fn fn = (netplay_stop_fn)GetProcAddress(h, "sidecar_stop");
+        if (!fn) fn = (netplay_stop_fn)GetProcAddress(h, "netplay_stop");
+        if (fn) fn();
+    }
+#elif !defined(SONICR_DC)
+    typedef void (*netplay_stop_fn)(void);
+    netplay_stop_fn fn = NULL;
+
+    /* 1. Try global symbol lookup across loaded libraries */
+    fn = (netplay_stop_fn)dlsym(RTLD_DEFAULT, "netplay_stop");
+
+    /* 2. Fallback to explicit dlopen if not yet resolved */
+    if (!fn) {
+        void *handle = dlopen("libsonicr_netplay.so", RTLD_NOW);
+        if (!handle) {
+            handle = dlopen("libsonicr_netplay.so", RTLD_NOW | RTLD_NOLOAD);
+        }
+        if (handle) {
+            fn = (netplay_stop_fn)dlsym(handle, "netplay_stop");
+        }
+    }
+
+    if (fn) {
+#ifdef __ANDROID__
+        __android_log_print(ANDROID_LOG_INFO, "SonicRNetplay", "net_sidecar_stop: invoking netplay_stop()");
+#else
+        printf("[NET_DEBUG] net_sidecar_stop: invoking netplay_stop()\n");
+        fflush(stdout);
+#endif
+        fn();
+    } else {
+#ifdef __ANDROID__
+        __android_log_print(ANDROID_LOG_WARN, "SonicRNetplay", "net_sidecar_stop: netplay_stop symbol not found");
+#else
+        printf("[NET_DEBUG] net_sidecar_stop: netplay_stop symbol not found\n");
+        fflush(stdout);
+#endif
+    }
+#endif
+}
 
 extern void platform_pump_events(void);
+void EnumNetworkSessions(int flag);
 
 /* =====================================================================
  * Receive thread — packet ring buffer
@@ -34,7 +99,7 @@ extern void platform_pump_events(void);
  * and enqueues packets; main thread dequeues in ApplyNetworkPlayerState.
  * ===================================================================== */
 
-#define NET_QUEUE_SIZE 64
+#define NET_QUEUE_SIZE 256
 
 typedef struct {
     char data[NET_MAX_PACKET];
@@ -287,9 +352,6 @@ static char s_netSlotNames[NET_MAX_PLAYERS][MM_MAX_USERNAME];
 static char    s_netSlotPlatform[NET_MAX_PLAYERS][NET_PLATFORM_LEN];
 static uint8_t s_netSlotRegion[NET_MAX_PLAYERS];
 
-/* Client: 1 once we've received SLOT_ASSIGN from the host. Gates client→host
- * sends so we don't spray pad packets at a host that hasn't accepted us. */
-static int s_haveSlotAssign = 0;
 
 static DWORD s_lastHostPacketMs = 0;
 
@@ -316,62 +378,6 @@ static int s_clientKeyframeCountdown;
 
 #define KEYFRAME_INTERVAL 30
 
-/* Protocol version, carried in header bytes 10-11 of NET_MSG_SNAPSHOT and
- * NET_MSG_CLIENT_INPUT. The v1.0 release wrote those bytes as zero and never
- * read them, so a peer reporting 0 is v1.0. The wire format itself is
- * unchanged at version 1; the marker exists so the next change can be
- * detected instead of silently mis-decoded. */
-#define NET_PROTOCOL_VERSION 1
-static unsigned short s_peerProtoVersion[MAX_PLAYERS];
-static unsigned char  s_peerProtoSeen[MAX_PLAYERS];
-
-void EnumNetworkSessions(int flag);   /* CHAR_CHANGE broadcast, defined below */
-
-/* Apply a character id learned over the network to a slot this machine does
- * not simulate. charId drives the animation tables; _unk_0x1E0 is what the
- * renderer draws, and InitPlayerSlot copies it from charId once at level
- * init, so a change that lands after that would leave the old model on
- * screen (issue #13). If the slot's frame stream is already live, re-seed it
- * from the new character's table the way TickPlayerAnimation does on an
- * animation change, so the cursor never points into the old character's
- * data. */
-static void net_apply_char_id(int slot, short charId)
-{
-    Player *pl = &g_playerBase[slot];
-
-    if (pl->charId == charId && pl->_unk_0x1E0 == charId) return;
-
-    pl->charId = charId;
-    pl->_unk_0x1E0 = charId;
-
-    if (slot < 10 && g_animDataPtrs[slot] != NULL && g_charAnimTables != NULL) {
-        void **tables = (void **)g_charAnimTables;
-        uintptr_t *animPtrs = (uintptr_t *)tables[charId * 2];
-        int animCount = (int)(uintptr_t)tables[charId * 2 + 1];
-        int animIdx = pl->animId;
-
-        g_animDataPtrs[slot] = NULL;
-        if (animPtrs != NULL && animIdx >= 0 && animIdx < animCount) {
-            uintptr_t frameAddr = animPtrs[animIdx];
-            if (frameAddr == 0 && animIdx + 1 < animCount) {
-                frameAddr = animPtrs[animIdx + 1];
-            }
-            g_animDataPtrs[slot] = (const short *)frameAddr;
-        }
-    }
-}
-
-static void net_note_peer_version(int playerIdx, unsigned int ver)
-{
-    if (playerIdx < 0 || playerIdx >= MAX_PLAYERS) return;
-    if (s_peerProtoSeen[playerIdx] && s_peerProtoVersion[playerIdx] == ver) return;
-    s_peerProtoSeen[playerIdx] = 1;
-    s_peerProtoVersion[playerIdx] = (unsigned short)ver;
-    DebugLog("Net: player %d speaks protocol %u, ours is %u%s\n",
-             playerIdx, ver, (unsigned int)NET_PROTOCOL_VERSION,
-             (ver != NET_PROTOCOL_VERSION) ? " (MISMATCH)" : "");
-}
-
 static void NetSnapshotReset(void)
 {
     int i;
@@ -386,8 +392,58 @@ static void NetSnapshotReset(void)
     }
     s_hostKeyframeCountdown = 0;
     s_clientKeyframeCountdown = 0;
-    memset(s_peerProtoSeen, 0, sizeof(s_peerProtoSeen));
-    memset(s_peerProtoVersion, 0, sizeof(s_peerProtoVersion));
+}
+
+/* Send join request (NET_MSG_JOIN_REQ) to host, mimicking --autojoin behavior on PC */
+static void send_client_join_request(void)
+{
+    if (s_haveSlotAssign) return;
+
+    DWORD now = timeGetTime();
+    if (s_lastJoinReqMs != 0 && (now - s_lastJoinReqMs < 500)) {
+        return;
+    }
+    s_lastJoinReqMs = now;
+
+    /* Ensure client transport connection is initialized */
+    if (!net_is_active()) {
+        extern const char *g_cmdHostIP;
+        const char *hip = (g_cmdHostIP != NULL && g_cmdHostIP[0] != '\0') ? g_cmdHostIP : "127.0.0.1";
+        net_client_connect(hip, NET_PORT_DEFAULT);
+    }
+
+    struct __attribute__((packed)) {
+        int     hdr;
+        char    name[MM_MAX_USERNAME];
+        char    platform[16];
+        uint8_t region;
+        short   charId;
+    } joinReq;
+    memset(&joinReq, 0, sizeof(joinReq));
+    joinReq.hdr = NET_MSG_JOIN_REQ;
+    const char *uname = MatchmakerGetUsername();
+    if (uname == NULL || uname[0] == '\0') {
+        uname = "Player";
+    }
+    strncpy(joinReq.name, uname, MM_MAX_USERNAME - 1);
+    strncpy(joinReq.platform, MM_PLATFORM, sizeof(joinReq.platform) - 1);
+    joinReq.region = (uint8_t)platform_get_region();
+    joinReq.charId = (short)g_menuPlayer.charId;
+
+    net_send_to_host(&joinReq, sizeof(joinReq));
+
+    printf("[NET_DEBUG] Client: sent NET_MSG_JOIN_REQ as '%s' (platform=%s, region=%d)\n",
+           joinReq.name, joinReq.platform, joinReq.region);
+    fflush(stdout);
+#ifdef __ANDROID__
+    __android_log_print(ANDROID_LOG_INFO, "SonicRNetplay",
+                        "Client: sent NET_MSG_JOIN_REQ as '%s' (platform=%s, region=%d)",
+                        joinReq.name, joinReq.platform, joinReq.region);
+#endif
+
+    if (g_resultsState < 2) {
+        g_resultsState = 2;
+    }
 }
 
 /* Per-player state within a snapshot — matches 0xFFF0002F layout minus 4-byte header */
@@ -566,7 +622,7 @@ static int net_build_snapshot(char *buf, int maxlen)
         wl16(buf + 6, frame);
         buf[8] = count;
         buf[9] = is_keyframe ? 1 : 0;
-        wl16(buf + 10, NET_PROTOCOL_VERSION);
+        buf[10] = buf[11] = 0;
     }
 
     offset = SNAP_HEADER_SIZE;
@@ -604,7 +660,6 @@ static void net_apply_snapshot(const char *buf, int len)
 
     count = (uint8_t)buf[8];
     is_keyframe = (buf[9] & 1);
-    net_note_peer_version(0, rl16u(buf + 10));   /* snapshots come from the host, player 0 */
     if (count > NET_MAX_PLAYERS) count = NET_MAX_PLAYERS;
 
     offset = SNAP_HEADER_SIZE;
@@ -880,7 +935,7 @@ void SendNetworkHostData(void)
         if (s_hostSlotLastRecvMs[i] == 0) continue;
 
         DWORD silent = now - s_hostSlotLastRecvMs[i];
-        if (silent > 5000) {
+        if (silent > 45000) {
             DebugLog("Player %d disconnected (silent %ums)\n", i, (unsigned)silent);
             g_playerBase[i].netConnected = 0;
             g_playerBase[i].netActive = 0;
@@ -891,21 +946,8 @@ void SendNetworkHostData(void)
         }
     }
 
-    if (g_netDisconnectFlag == 0) {
-        int anyRemote = 0;
-        for (i = 0; i < g_netPlayerCount; i++) {
-            if (i == g_localPlayerIndex) continue;
-            if (g_playerBase[i].netActive) { anyRemote = 1; break; }
-        }
-        if (!anyRemote) {
-            DebugLog("All remote players disconnected — exiting race\n");
-            g_netDisconnectFlag = 1;
-            if (g_fadeState != FADE_OUT) {
-                g_fadeState = FADE_OUT;
-                g_fadeSpeed = 0xC;
-            }
-        }
-    }
+    /* Remote player disconnects do not terminate the host's active race.
+     * Inactive player slots simply stop updating positions. */
 
     g_netSyncEstablished = 1;
 }
@@ -942,7 +984,7 @@ void UpdateNetworkClient(void)
                     wl16(pkt + 6, localInput);
                     pkt[8] = (uint8_t)g_localPlayerIndex;
                     pkt[9] = is_kf ? 1 : 0;
-                    wl16(pkt + 10, NET_PROTOCOL_VERSION);
+                    pkt[10] = pkt[11] = 0;
                     bodyLen = net_delta_encode(
                         &s_deltaSend[g_localPlayerIndex],
                         &g_playerBase[g_localPlayerIndex],
@@ -964,16 +1006,14 @@ void UpdateNetworkClient(void)
              *   +0x04 uint16_t seq
              *   +0x06 uint16_t inputBits
              *   +0x08 uint8_t  playerIdx
-             *   +0x09 uint8_t  pad        = 0
-             *   +0x0A uint16_t protocol version */
+             *   +0x09 uint8_t  pad[3]     = 0 */
             {
                 char _ipkt[12];
                 wl32(_ipkt + 0, (uint32_t)NET_MSG_CLIENT_INPUT);
                 wl16(_ipkt + 4, s_clientInputSeq++);
                 wl16(_ipkt + 6, localInput);
                 _ipkt[8] = (uint8_t)g_localPlayerIndex;
-                _ipkt[9] = 0;
-                wl16(_ipkt + 10, NET_PROTOCOL_VERSION);
+                _ipkt[9] = _ipkt[10] = _ipkt[11] = 0;
                 SendNetworkPacket(_ipkt, 12);
             }
 #endif
@@ -1043,6 +1083,7 @@ void CloseDirectPlaySession(void)
         net_send_to_host(_lbuf, 4);
     }
     s_haveSlotAssign = 0;
+    s_lastJoinReqMs = 0;
     memset(s_hostSlotLastRecvMs, 0, sizeof(s_hostSlotLastRecvMs));
 
     /* Host/client discriminator, set to 1 by CreateNetworkSession (main.c).
@@ -1053,6 +1094,7 @@ void CloseDirectPlaySession(void)
 
     NetRecvThread_Stop();
     net_close();
+    net_sidecar_stop();
     DebugLog("Session Closed & Player Destroyed.\n");
 }
 
@@ -1086,8 +1128,8 @@ void WaitForNetworkData(void)
     int from_slot;
     int gotData = 0;
 
-    /* Timeout: 60s on first frame, 5s thereafter — binary: WaitForSingleObject */
-    DWORD timeout = (g_netSyncEstablished == 0) ? 60000 : 5000;
+    /* Timeout: 60s on first frame, 45s thereafter — binary: WaitForSingleObject */
+    DWORD timeout = (g_netSyncEstablished == 0) ? 60000 : 45000;
     DWORD deadline = timeGetTime() + timeout;
 
     /* Poll for game data broadcast (0xFF0000F0, 16 bytes) from host */
@@ -1391,11 +1433,17 @@ void InitNetworkGame(void)
      * g_netTrackIndex (0x68A8A0) and g_netRaceSubModeIndex (0x68A8A2)
      * overlapped g_netGameInfoDest[1] at the same address.  The lobby
      * writes track/mode into [1]; race init reads g_netTrackIndex.
-     * In C these are separate variables, so copy explicitly. */
-    g_netTrackIndex       = (int)(short)(g_netGameInfoDest[1] & 0xFFFF);       /* [1] low word */
-    g_netRaceSubModeIndex = (int)(short)(g_netGameInfoDest[1] >> 16);        /* [1] high word */
-    g_netWeatherType      = (int)(short)(g_netGameInfoDest[2] & 0xFFFF);     /* [2] low word */
-    g_netPlayerMode       = (int)(short)(g_netGameInfoDest[2] >> 16);        /* [2] high word */
+     * In C these are separate variables, so copy explicitly on host.
+     * On client, these were already set from the host's START_GAME packet. */
+    if (net_is_host()) {
+        g_netTrackIndex       = (int)(short)(g_netGameInfoDest[1] & 0xFFFF);       /* [1] low word */
+        g_netRaceSubModeIndex = (int)(short)(g_netGameInfoDest[1] >> 16);        /* [1] high word */
+        g_netWeatherType      = (int)(short)(g_netGameInfoDest[2] & 0xFFFF);     /* [2] low word */
+        g_netPlayerMode       = (int)(short)(g_netGameInfoDest[2] >> 16);        /* [2] high word */
+    }
+    if (g_netTrackIndex < 0 || g_netTrackIndex >= 5) {
+        g_netTrackIndex = 0;
+    }
 
     /* SDL: host tells clients to start the game — includes track/mode and
      * per-player character IDs so the client can populate player
@@ -1403,6 +1451,9 @@ void InitNetworkGame(void)
      * session/player data that our SDL port doesn't have).
      * Client skips this — it already received START_GAME to get here. */
     if (net_is_host()) {
+        g_playerBase[g_localPlayerIndex].charId = (short)g_menuPlayer.charId;
+        *(int *)(g_netPlayerDecorations + g_localPlayerIndex * NET_DECO_STRIDE + NET_DECO_LOBBYCHAR) = (int)g_menuPlayer.charId;
+
         /* START_GAME packet layout (16 + NET_MAX_PLAYERS*2 bytes):
          *   +0x00 int   hdr              = NET_MSG_START_GAME
          *   +0x04 int   playerCount
@@ -1491,8 +1542,34 @@ void ApplyNetworkPlayerState(void)
     for (i = 0; i < 4; i++)
         s_playerRecvFlags[i] = 0;
 
+    /* Check for discovery response on discovery socket if in client join mode */
+    if (!net_is_host() && !s_haveSlotAssign) {
+        char discHost[64];
+        if (net_discover_check(discHost, sizeof(discHost))) {
+            printf("[NET_DEBUG] Client: net_discover_check received NET_DISCOVER_REPLY from %s\n", discHost);
+            fflush(stdout);
+#ifdef __ANDROID__
+            __android_log_print(ANDROID_LOG_INFO, "SonicRNetplay",
+                                "Client: net_discover_check received NET_DISCOVER_REPLY from %s", discHost);
+#endif
+            extern const char *g_cmdHostIP;
+            if (g_cmdHostIP == NULL || strcmp(g_cmdHostIP, "127.0.0.1") == 0) {
+                net_client_connect(discHost, NET_PORT_DEFAULT);
+            }
+            send_client_join_request();
+        }
+    }
+
+    /* Client join request retry while waiting for host slot assignment (lobby only) */
+    if (!net_is_host() && !s_haveSlotAssign && net_is_active() && g_netSessionActive == 0) {
+        send_client_join_request();
+    }
+
     /* Process all pending network messages */
     while ((len = net_poll_one(buf, sizeof(buf), &from_slot)) > 0) {
+        if (!net_is_host()) {
+            s_lastHostPacketMs = timeGetTime();
+        }
         if (len < 4) continue;  /* need at least a header */
 
         unsigned int header = rl32u(buf);
@@ -1500,6 +1577,18 @@ void ApplyNetworkPlayerState(void)
             printf("[NET_DEBUG] %s: dequeued packet 0x%08X (len=%d) from slot %d\n",
                    net_is_host() ? "Host" : "Client", header, len, from_slot);
             fflush(stdout);
+        }
+
+        /* Discovery response from host: immediately trigger join request (mimicking --autojoin on PC) */
+        if (!net_is_host() && header == NET_DISCOVER_REPLY) {
+            printf("[NET_DEBUG] Client: received NET_DISCOVER_REPLY from host via net_poll_one, triggering JOIN_REQ\n");
+            fflush(stdout);
+#ifdef __ANDROID__
+            __android_log_print(ANDROID_LOG_INFO, "SonicRNetplay",
+                                "Client: received NET_DISCOVER_REPLY from host via net_poll_one, triggering JOIN_REQ");
+#endif
+            send_client_join_request();
+            continue;
         }
 
         /* If client receives race traffic (snapshot or client input), the race has already started on host */
@@ -1575,26 +1664,20 @@ void ApplyNetworkPlayerState(void)
         if (net_is_host() && from_slot >= 1 && from_slot < NET_MAX_PLAYERS
             && from_slot >= g_netPlayerCount
             && header != NET_MSG_JOIN_REQ) {
-            /* struct { int hdr; int slot; } reply;
-             * reply.hdr  = NET_MSG_SLOT_ASSIGN;
-             * reply.slot = from_slot;
-             * net_send_to(from_slot, &reply, sizeof(reply));
-             * g_netPlayerCount = from_slot + 1;
-             * DebugLog("Host: implicit join for slot %d, playerCount=%d\n",
-             *          from_slot, g_netPlayerCount);
-             * { extern int g_netLobbyPlayerSlot;
-             *   g_netLobbyPlayerSlot = from_slot; } */
-            fprintf(stderr,
-                    "FATAL: packet header 0x%08x from unregistered slot %d before NET_MSG_JOIN_REQ. "
-                    "Client must send JOIN_REQ first.\n",
-                    header, from_slot);
-            abort();
+            DebugLog("Warning: ignoring packet 0x%08x from unconfirmed slot %d (playerCount=%d)\n",
+                     header, from_slot, g_netPlayerCount);
+            continue;
         }
 
         /* ---- SDL session protocol: join request / slot assignment ---- */
         if (header == NET_MSG_JOIN_REQ && net_is_host()) {
             printf("[NET_DEBUG] Host: handling JOIN_REQ from slot %d (len=%d)\n", from_slot, len);
             fflush(stdout);
+
+            if (from_slot >= NET_MAX_PLAYERS || g_netPlayerCount >= 4) {
+                printf("[NET_WARN] Host: Lobby is full (count=%d), rejecting slot %d\n", g_netPlayerCount, from_slot);
+                return;
+            }
             /* Host: client requested a slot. from_slot was auto-assigned
              * by net_recv(). Payload carries the client's matchmaker
              * username; we use it to populate the decoration table.
@@ -1616,6 +1699,14 @@ void ApplyNetworkPlayerState(void)
                     joinerRegion = (uint8_t)buf[4 + MM_MAX_USERNAME + NET_PLATFORM_LEN];
                 }
 
+                if (len >= (int)(4 + MM_MAX_USERNAME + NET_PLATFORM_LEN + 1 + sizeof(short))) {
+                    short cid = rl16s(buf + 4 + MM_MAX_USERNAME + NET_PLATFORM_LEN + 1);
+                    if (cid >= 0 && cid < CHAR_COUNT) {
+                        g_playerBase[from_slot].charId = cid;
+                        *(int *)(g_netPlayerDecorations + from_slot * NET_DECO_STRIDE + NET_DECO_LOBBYCHAR) = (int)cid;
+                    }
+                }
+
                 g_netPlayerCount = from_slot + 1;  /* grow as players join */
                 printf("[NET_DEBUG] Host: client joined as slot %d ('%s' %s r%d), g_netPlayerCount is now %d\n",
                        from_slot, joinerName, joinerPlatform, joinerRegion, g_netPlayerCount);
@@ -1633,45 +1724,46 @@ void ApplyNetworkPlayerState(void)
                     net_set_slot_platform(from_slot, joinerPlatform, joinerRegion);
                 }
 
-                /* Build extended SLOT_ASSIGN reply with platform/region info.
+                /* Ensure host slot 0 has host's menu pick */
+                g_playerBase[0].charId = (short)g_menuPlayer.charId;
+                *(int *)(g_netPlayerDecorations + 0 * NET_DECO_STRIDE + NET_DECO_LOBBYCHAR) = (int)g_menuPlayer.charId;
+
+                /* Build extended SLOT_ASSIGN reply with platform/region and character info.
                  * Wire layout:
                  *   +0x00 int     hdr
                  *   +0x04 int     slot
                  *   +0x08 char    names[NET_MAX_PLAYERS][MM_MAX_USERNAME]
                  *   +... char    platforms[NET_MAX_PLAYERS][NET_PLATFORM_LEN]
-                 *   +... uint8_t regions[NET_MAX_PLAYERS] */
+                 *   +... uint8_t regions[NET_MAX_PLAYERS]
+                 *   +... short   charIds[NET_MAX_PLAYERS] */
                 {
                     enum { REPLY_SIZE = 8
                         + NET_MAX_PLAYERS * MM_MAX_USERNAME
                         + NET_MAX_PLAYERS * NET_PLATFORM_LEN
-                        + NET_MAX_PLAYERS };
+                        + NET_MAX_PLAYERS
+                        + NET_MAX_PLAYERS * sizeof(short) };
                     char _replybuf[REPLY_SIZE];
                     int _off;
                     memset(_replybuf, 0, sizeof(_replybuf));
                     wl32(_replybuf + 0, (uint32_t)NET_MSG_SLOT_ASSIGN);
                     wl32(_replybuf + 4, (uint32_t)from_slot);
                     _off = 8;
-                    {
-                        int s;
-                        for (s = 0; s < NET_MAX_PLAYERS; s++) {
-                            strncpy(_replybuf + _off + s * MM_MAX_USERNAME,
-                                    net_get_slot_name(s), MM_MAX_USERNAME - 1);
-                        }
+                    for (int s = 0; s < NET_MAX_PLAYERS; s++) {
+                        strncpy(_replybuf + _off + s * MM_MAX_USERNAME,
+                                net_get_slot_name(s), MM_MAX_USERNAME - 1);
                     }
                     _off += NET_MAX_PLAYERS * MM_MAX_USERNAME;
-                    {
-                        int s;
-                        for (s = 0; s < NET_MAX_PLAYERS; s++) {
-                            strncpy(_replybuf + _off + s * NET_PLATFORM_LEN,
-                                    net_get_slot_platform(s), NET_PLATFORM_LEN - 1);
-                        }
+                    for (int s = 0; s < NET_MAX_PLAYERS; s++) {
+                        strncpy(_replybuf + _off + s * NET_PLATFORM_LEN,
+                                net_get_slot_platform(s), NET_PLATFORM_LEN - 1);
                     }
                     _off += NET_MAX_PLAYERS * NET_PLATFORM_LEN;
-                    {
-                        int s;
-                        for (s = 0; s < NET_MAX_PLAYERS; s++) {
-                            _replybuf[_off + s] = (char)net_get_slot_region(s);
-                        }
+                    for (int s = 0; s < NET_MAX_PLAYERS; s++) {
+                        _replybuf[_off + s] = (char)net_get_slot_region(s);
+                    }
+                    _off += NET_MAX_PLAYERS;
+                    for (int s = 0; s < NET_MAX_PLAYERS; s++) {
+                        wl16(_replybuf + _off + s * 2, (uint16_t)g_playerBase[s].charId);
                     }
                     printf("[NET_DEBUG] Host: sending SLOT_ASSIGN (%d bytes) to slot %d\n", REPLY_SIZE, from_slot);
                     fflush(stdout);
@@ -1737,11 +1829,15 @@ void ApplyNetworkPlayerState(void)
                     : NULL;
 
                 int s;
+                int initialCount = slot + 1;
                 for (s = 0; s < NET_MAX_PLAYERS; s++) {
                     char nm[MM_MAX_USERNAME];
                     memcpy(nm, names + s * MM_MAX_USERNAME, MM_MAX_USERNAME);
                     nm[MM_MAX_USERNAME - 1] = '\0';
                     if (nm[0] == '\0') continue;
+                    if (s + 1 > initialCount) {
+                        initialCount = s + 1;
+                    }
                     char *entry = g_netPlayerDecorations + s * NET_DECO_STRIDE;
                     *(int *)(entry + NET_DECO_DPID) = s;
                     *(unsigned short *)(entry + NET_DECO_SLOT) = (unsigned short)s;
@@ -1754,9 +1850,31 @@ void ApplyNetworkPlayerState(void)
                         net_set_slot_platform(s, plat, regions[s]);
                     }
                 }
-                DebugLog("Client: SLOT_ASSIGN slot=%d, host='%s'\n",
-                         slot, net_get_slot_name(0));
+                g_netPlayerCount = initialCount;
+                g_resultsPlayerCount = initialCount;
+
+                int charBlockOff = 8 + NET_MAX_PLAYERS * MM_MAX_USERNAME + NET_MAX_PLAYERS * NET_PLATFORM_LEN + NET_MAX_PLAYERS;
+                if (len >= charBlockOff + NET_MAX_PLAYERS * 2) {
+                    for (int s = 0; s < NET_MAX_PLAYERS; s++) {
+                        if (s != slot) {
+                            short remoteCid = rl16s(buf + charBlockOff + s * 2);
+                            if (remoteCid >= 0 && remoteCid < CHAR_COUNT) {
+                                g_playerBase[s].charId = remoteCid;
+                                *(int *)(g_netPlayerDecorations + s * NET_DECO_STRIDE + NET_DECO_LOBBYCHAR) = (int)remoteCid;
+                            }
+                        }
+                    }
+                }
+                g_playerBase[slot].charId = (short)g_menuPlayer.charId;
+                *(int *)(g_netPlayerDecorations + slot * NET_DECO_STRIDE + NET_DECO_LOBBYCHAR) = (int)g_menuPlayer.charId;
+
                 s_haveSlotAssign = 1;
+                EnumNetworkSessions(0);
+                DebugLog("Client: SLOT_ASSIGN slot=%d, playerCount=%d, host='%s'\n",
+                         slot, g_netPlayerCount, net_get_slot_name(0));
+                if (g_resultsState < 2) {
+                    g_resultsState = 2;
+                }
             }
             continue;
         }
@@ -1768,6 +1886,10 @@ void ApplyNetworkPlayerState(void)
              * the real name. */
             int slot = rl32s(buf + 4);
             if (slot >= 0 && slot < NET_MAX_PLAYERS) {
+                if (slot + 1 > g_netPlayerCount) {
+                    g_netPlayerCount = slot + 1;
+                    g_resultsPlayerCount = g_netPlayerCount;
+                }
                 char nm[MM_MAX_USERNAME];
                 memcpy(nm, buf + 8, MM_MAX_USERNAME);
                 nm[MM_MAX_USERNAME - 1] = '\0';
@@ -1838,10 +1960,10 @@ void ApplyNetworkPlayerState(void)
                                 (int)cid, k);
                         continue;
                     }
-                    net_apply_char_id(k, cid);
+                    g_playerBase[k].charId = cid;
                 }
                 /* Restore local player's own pick */
-                net_apply_char_id(g_localPlayerIndex, g_menuPlayer.charId);
+                g_playerBase[g_localPlayerIndex].charId = g_menuPlayer.charId;
             }
 
             /* Populate decoration table.  Real names should already be in
@@ -1871,11 +1993,6 @@ void ApplyNetworkPlayerState(void)
             printf("[NET_DEBUG] Client: calling InitNetworkGame()...\n");
             fflush(stdout);
             InitNetworkGame();
-
-            /* Last chance for the host to learn our character before its
-             * InitPlayerSlot runs: it keeps draining packets until this ACK
-             * lands, so send the pick again first (issue #13). */
-            EnumNetworkSessions(0);
 
             /* ACK so host stops retransmitting
              * Wire: 4 bytes, int header = NET_MSG_START_ACK */
@@ -1908,13 +2025,14 @@ void ApplyNetworkPlayerState(void)
                 continue;
             }
             if (slot >= 0 && slot < NET_MAX_PLAYERS) {
-                net_apply_char_id(slot, charId);
-                /* Also update decoration table so host has it for START_GAME */
+                g_playerBase[slot].charId = charId;
                 *(int *)(g_netPlayerDecorations + slot * NET_DECO_STRIDE + NET_DECO_LOBBYCHAR) = (int)charId;
 
-                /* Host: relay to other clients so they see the change too */
                 if (net_is_host()) {
-                    net_broadcast(buf, len);
+                    for (int s = 1; s < g_netPlayerCount; s++) {
+                        if (s == from_slot) continue;
+                        net_send_to(s, buf, len);
+                    }
                 }
             }
             continue;
@@ -1936,30 +2054,29 @@ void ApplyNetworkPlayerState(void)
             uint16_t seq = rl16u(buf + 4);
             unsigned short inputBits = rl16u(buf + 6);
             uint8_t playerIdx = *(uint8_t *)(buf + 8);
-            if (playerIdx < MAX_PLAYERS &&
-                g_playerBase[playerIdx].netActive != 0 &&
-                (int16_t)(seq - s_lastRecvInputSeq[playerIdx]) > 0) {
-                s_lastRecvInputSeq[playerIdx] = seq;
-                s_netInputBuffer[playerIdx] = inputBits;
-                g_netPlayerRecvd[playerIdx] = 1;
+            if (playerIdx < MAX_PLAYERS && g_playerBase[playerIdx].netActive != 0) {
                 s_hostSlotLastRecvMs[playerIdx] = timeGetTime();
-                net_note_peer_version((int)playerIdx, rl16u(buf + 10));
+                if ((int16_t)(seq - s_lastRecvInputSeq[playerIdx]) > 0) {
+                    s_lastRecvInputSeq[playerIdx] = seq;
+                    s_netInputBuffer[playerIdx] = inputBits;
+                    g_netPlayerRecvd[playerIdx] = 1;
 #if NET_PEER_AUTHORITATIVE
-                if (len > 12) {
-                    Player *cpl = &g_playerBase[playerIdx];
-                    short prevLaps = cpl->lapsCompleted;
-                    int is_kf = (buf[9] & 1);
-                    net_delta_decode(&s_deltaRecv[playerIdx],
-                                     (const unsigned char *)buf + 12,
-                                     len - 12, is_kf, cpl);
-                    if (cpl->lapsCompleted == 3 && prevLaps < 3) {
-                        int counter = g_finishOrderCounter;
-                        cpl->trackProgress = (int)(0xFFFFFFFF - (unsigned int)counter);
-                        g_finishOrderCounter = counter + 1;
+                    if (len > 12) {
+                        Player *cpl = &g_playerBase[playerIdx];
+                        short prevLaps = cpl->lapsCompleted;
+                        int is_kf = (buf[9] & 1);
+                        net_delta_decode(&s_deltaRecv[playerIdx],
+                                         (const unsigned char *)buf + 12,
+                                         len - 12, is_kf, cpl);
+                        if (cpl->lapsCompleted == 3 && prevLaps < 3) {
+                            int counter = g_finishOrderCounter;
+                            cpl->trackProgress = (int)(0xFFFFFFFF - (unsigned int)counter);
+                            g_finishOrderCounter = counter + 1;
+                        }
+                        NetInterpRecord((int)playerIdx);
                     }
-                    NetInterpRecord((int)playerIdx);
-                }
 #endif
+                }
             }
             continue;
         }
@@ -2065,24 +2182,24 @@ void ApplyNetworkPlayerState(void)
             uint16_t frame = rl16u(buf + 6);
             g_gameDataPacketFrame = frame;
             g_netSessionFrame = (int)frame;
-            s_lastHostPacketMs = timeGetTime();
         }
     }
 
-    if (!net_is_host() && net_is_active() && s_lastHostPacketMs != 0
-        && g_introCountdown == 0) {
+    if (!net_is_host() && net_is_active() && s_lastHostPacketMs != 0 && g_introCountdown == 0) {
         DWORD now    = timeGetTime();
         DWORD silent = now - s_lastHostPacketMs;
-        if (silent > 5000 && g_netDisconnectFlag == 0) {
-            DebugLog("Host disconnected (silent for %ums) — exiting race\n",
-                     (unsigned)silent);
+        if (silent > 60000 && g_netDisconnectFlag == 0) {
+            DebugLog("Host disconnected (silent for %ums) — exiting race\n", (unsigned)silent);
             g_netDisconnectFlag = 1;
             if (g_fadeState != FADE_OUT) {
                 g_fadeState = FADE_OUT;
                 g_fadeSpeed = 0xC;
             }
             s_lastHostPacketMs = 0;
-            s_haveSlotAssign   = 0;
+            if (g_netSessionActive == 0) {
+                s_haveSlotAssign = 0;
+                s_lastJoinReqMs  = 0;
+            }
         }
     }
 
@@ -2128,26 +2245,21 @@ void EnumNetworkSessions(int flag)
     (void)flag;
     if (!net_is_active()) return;
 
-    /* A client has no slot until the host answers JOIN_REQ with SLOT_ASSIGN —
-     * net_client_connect leaves net_local_slot() at -1 until then. The socket
-     * is live from the moment we connect, so "active" is not "joined", and
-     * broadcasting here beforehand makes CHAR_CHANGE the first packet the host
-     * ever sees from us. ProcessNetworkMessages rightly treats that as fatal.
-     * Reachable because callers key off lobby state alone (screen_misc.c:4349)
-     * and ns_lobbyState survives leaving and re-entering the network screen. */
+    int slot = net_is_host() ? 0 : g_localPlayerIndex;
+    if (slot >= 0 && slot < NET_MAX_PLAYERS) {
+        g_playerBase[slot].charId = (short)g_menuPlayer.charId;
+        *(int *)(g_netPlayerDecorations + slot * NET_DECO_STRIDE + NET_DECO_LOBBYCHAR) = (int)g_menuPlayer.charId;
+    }
+
     if (!net_is_host() && net_local_slot() < 0) {
         return;
     }
 
-    /* Wire layout (8 bytes):
-     *   +0x00 int   hdr    = NET_MSG_CHAR_CHANGE
-     *   +0x04 short slot
-     *   +0x06 short charId */
     char _ccbuf[8];
     wl32(_ccbuf + 0, (uint32_t)NET_MSG_CHAR_CHANGE);
-    wl16(_ccbuf + 4, (uint16_t)(short)g_localPlayerIndex);
+    wl16(_ccbuf + 4, (uint16_t)(short)slot);
     wl16(_ccbuf + 6, (uint16_t)g_menuPlayer.charId);
-    UpdateNetworkSync(_ccbuf, 8);
+    SendNetworkPacket(_ccbuf, 8);
 }
 
 /* FUN_00487674 — 58 bytes — called 1x — VALIDATED
