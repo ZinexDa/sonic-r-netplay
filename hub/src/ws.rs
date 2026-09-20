@@ -119,11 +119,14 @@ pub async fn handle_socket(
                 // [16-byte punch_token][1-byte msg_type][payload...]
                 if bytes.len() >= 17 {
                     if let Ok(token) = uuid::Uuid::from_slice(&bytes[..16]) {
-                        if let Some(pairing) = state.pairings.get(&token) {
-                            if pairing.host_peer_addr == peer_addr {
+                        if let Some(mut pairing) = state.pairings.get_mut(&token) {
+                            pairing.last_activity = Instant::now();
+                            if pairing.host_tx.same_channel(&out_tx) {
                                 let _ = pairing.client_tx.send(Message::Binary(bytes));
-                            } else {
+                            } else if pairing.client_tx.same_channel(&out_tx) {
                                 let _ = pairing.host_tx.send(Message::Binary(bytes));
+                            } else {
+                                tracing::warn!(%token, "Binary frame received from unassociated channel for pairing");
                             }
                         }
                     }
@@ -289,7 +292,7 @@ pub async fn handle_socket(
                         client_peer_addr: peer_addr,
                         host_relay_addr,
                         client_relay_addr,
-                        created_at: Instant::now(),
+                        last_activity: Instant::now(),
                     },
                 );
 
@@ -325,26 +328,17 @@ pub async fn handle_socket(
                 let (host_tx, client_tx, host_target, client_target) =
                     match state.pairings.get(&punch_token) {
                         Some(pairing) => {
-                            let relay_unreachable = state.skip_punch
-                                || (state.relay_public_addr.is_none() && pairing.host_relay_addr.ip().is_loopback());
-
-                            let (h_target, c_target) = if relay_unreachable {
-                                tracing::info!(
-                                    %punch_token,
-                                    host_direct = %pairing.host_addr,
-                                    client_direct = %pairing.client_addr,
-                                    "UDP relay unreachable or single-port mode; falling back to direct peer IP connection on RelayFallback"
-                                );
-                                (pairing.client_addr, pairing.host_addr)
-                            } else {
-                                (pairing.host_relay_addr, pairing.client_relay_addr)
-                            };
-
+                            tracing::info!(
+                                %punch_token,
+                                host_relay = %pairing.host_relay_addr,
+                                client_relay = %pairing.client_relay_addr,
+                                "Coordinating UDP relay fallback through relay endpoint"
+                            );
                             (
                                 pairing.host_tx.clone(),
                                 pairing.client_tx.clone(),
-                                h_target,
-                                c_target,
+                                pairing.host_relay_addr,
+                                pairing.client_relay_addr,
                             )
                         }
                         None => {

@@ -25,6 +25,7 @@ async fn spawn_test_hub() -> TestHub {
     let udp_addr = udp_sock.local_addr().unwrap();
     drop(udp_sock); // Release so run_punch_listener can bind to it
     tokio::spawn(run_punch_listener(udp_addr, state.clone()));
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     // Bind ephemeral TCP listener for Axum WS
     let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -405,14 +406,24 @@ fn test_dynamic_relay_address_resolution_from_host_header() {
     let resolved_lan = state_dynamic.resolve_relay_addr(Some("192.168.1.50:8080"));
     assert_eq!(resolved_lan, "192.168.1.50:9001".parse::<SocketAddr>().unwrap());
 
-    // 2. Localhost or non-IP in Host header -> falls back to loopback 127.0.0.1:9001
+    // 2. Domain in Host header -> resolves domain to IP on port 9001
+    let resolved_domain = state_dynamic.resolve_relay_addr(Some("de-bots3.h1cloud.net:8080"));
+    assert_eq!(resolved_domain.port(), 9001);
+    assert!(!resolved_domain.ip().is_loopback());
+
+    // 3. Localhost in Host header -> resolves to loopback on port 9001
     let resolved_lh = state_dynamic.resolve_relay_addr(Some("localhost:8080"));
     assert_eq!(resolved_lh, "127.0.0.1:9001".parse::<SocketAddr>().unwrap());
 
     let resolved_none = state_dynamic.resolve_relay_addr(None);
     assert_eq!(resolved_none, "127.0.0.1:9001".parse::<SocketAddr>().unwrap());
 
-    // 3. Explicitly configured relay address overrides Host header
+    // 4. Single-port mode overrides everything to loopback
+    let state_single_port = AppState::new("10.0.0.1:9999".parse().unwrap()).with_single_port(true);
+    let resolved_sp = state_single_port.resolve_relay_addr(Some("de-bots3.h1cloud.net:8080"));
+    assert_eq!(resolved_sp, "127.0.0.1:9001".parse::<SocketAddr>().unwrap());
+
+    // 5. Explicitly configured relay address overrides Host header
     let configured_addr: SocketAddr = "10.0.0.1:9999".parse().unwrap();
     let state_configured = AppState::new(configured_addr);
     let resolved_override = state_configured.resolve_relay_addr(Some("26.142.208.116:8080"));
@@ -501,7 +512,7 @@ async fn test_skip_punch_host_registration_and_join() {
 }
 
 #[tokio::test]
-async fn test_skip_punch_relay_fallback_direct_ip_and_ws_tunneling() {
+async fn test_skip_punch_relay_fallback_and_ws_tunneling() {
     let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let ws_addr = tcp_listener.local_addr().unwrap();
     let state = AppState::new_dynamic().with_skip_punch(true);
@@ -586,8 +597,8 @@ async fn test_skip_punch_relay_fallback_direct_ip_and_ws_tunneling() {
         .await
         .unwrap();
 
-    // In single-port mode without relay_public_addr and with skip_punch,
-    // host receives UseRelay pointing to the client's direct IP endpoint (port 5030)
+    // In dynamic/single-port mode without configured public relay_public_addr,
+    // host receives UseRelay pointing to the loopback relay endpoint (port 9001)
     let host_relay_msg = host_rx.next().await.unwrap().unwrap();
     let Message::Text(h_relay_text) = host_relay_msg else { panic!("expected text") };
     let HubMessage::UseRelay { punch_token: h_rf_token, relay_addr: h_target } =
@@ -596,9 +607,10 @@ async fn test_skip_punch_relay_fallback_direct_ip_and_ws_tunneling() {
         panic!("expected UseRelay on host, got: {h_relay_text}");
     };
     assert_eq!(h_rf_token, client_punch_token);
-    assert_eq!(h_target.port(), 5030);
+    assert_eq!(h_target.port(), 9001);
+    assert!(h_target.ip().is_loopback());
 
-    // Client receives UseRelay pointing to the host's direct IP endpoint (port 5029)
+    // Client receives UseRelay pointing to the loopback relay endpoint (port 9001)
     let client_relay_msg = client_rx.next().await.unwrap().unwrap();
     let Message::Text(c_relay_text) = client_relay_msg else { panic!("expected text") };
     let HubMessage::UseRelay { punch_token: c_rf_token, relay_addr: c_target } =
@@ -607,7 +619,8 @@ async fn test_skip_punch_relay_fallback_direct_ip_and_ws_tunneling() {
         panic!("expected UseRelay on client, got: {c_relay_text}");
     };
     assert_eq!(c_rf_token, client_punch_token);
-    assert_eq!(c_target.port(), 5029);
+    assert_eq!(c_target.port(), 9001);
+    assert!(c_target.ip().is_loopback());
 
     // 3. Test bidirectional WebSocket datagram tunneling
     // Host tunnels datagram to client: [16-byte punch token] + payload
@@ -631,6 +644,94 @@ async fn test_skip_punch_relay_fallback_direct_ip_and_ws_tunneling() {
         panic!("expected Binary message on host WS");
     };
     assert_eq!(host_received_bytes, client_packet);
+}
+
+#[tokio::test]
+async fn test_relay_fallback_with_configured_public_relay_addr() {
+    let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ws_addr = tcp_listener.local_addr().unwrap();
+    let public_relay: SocketAddr = "179.254.115.231:9001".parse().unwrap();
+    let state = AppState::new(public_relay).with_skip_punch(true);
+    let app = create_router(state.clone());
+
+    tokio::spawn(async move {
+        axum::serve(
+            tcp_listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+
+    let ws_url = format!("ws://{ws_addr}/ws");
+    let (host_stream, _) = connect_async(&ws_url).await.unwrap();
+    let (mut host_tx, mut host_rx) = host_stream.split();
+
+    let host_punch_token = uuid::Uuid::new_v4();
+    let register_msg = ClientMessage::RegisterHost {
+        name: "PublicRelayRoom".into(),
+        max_players: 4,
+        game_version: "0.1.0".into(),
+        udp_port: Some(5029),
+        punch_token: host_punch_token,
+    };
+    host_tx
+        .send(Message::Text(serde_json::to_string(&register_msg).unwrap()))
+        .await
+        .unwrap();
+
+    let host_reply = host_rx.next().await.unwrap().unwrap();
+    let Message::Text(h_text) = host_reply else { panic!("expected text") };
+    let HubMessage::Registered { server_id } = serde_json::from_str(&h_text).unwrap() else {
+        panic!("expected Registered");
+    };
+
+    let (client_stream, _) = connect_async(&ws_url).await.unwrap();
+    let (mut client_tx, mut client_rx) = client_stream.split();
+
+    let client_punch_token = uuid::Uuid::new_v4();
+    let join_msg = ClientMessage::JoinRequest {
+        server_id,
+        punch_token: client_punch_token,
+        udp_port: Some(5030),
+    };
+    client_tx
+        .send(Message::Text(serde_json::to_string(&join_msg).unwrap()))
+        .await
+        .unwrap();
+
+    let _h_cand = host_rx.next().await.unwrap().unwrap();
+    let _c_cand = client_rx.next().await.unwrap().unwrap();
+
+    // Client triggers RelayFallback
+    let fallback_msg = ClientMessage::RelayFallback {
+        punch_token: client_punch_token,
+    };
+    client_tx
+        .send(Message::Text(serde_json::to_string(&fallback_msg).unwrap()))
+        .await
+        .unwrap();
+
+    // Both host and client MUST receive UseRelay with the configured public relay address
+    let host_relay_msg = host_rx.next().await.unwrap().unwrap();
+    let Message::Text(h_relay_text) = host_relay_msg else { panic!("expected text") };
+    let HubMessage::UseRelay { punch_token: h_rf_token, relay_addr: h_target } =
+        serde_json::from_str(&h_relay_text).unwrap()
+    else {
+        panic!("expected UseRelay on host, got: {h_relay_text}");
+    };
+    assert_eq!(h_rf_token, client_punch_token);
+    assert_eq!(h_target, public_relay);
+
+    let client_relay_msg = client_rx.next().await.unwrap().unwrap();
+    let Message::Text(c_relay_text) = client_relay_msg else { panic!("expected text") };
+    let HubMessage::UseRelay { punch_token: c_rf_token, relay_addr: c_target } =
+        serde_json::from_str(&c_relay_text).unwrap()
+    else {
+        panic!("expected UseRelay on client, got: {c_relay_text}");
+    };
+    assert_eq!(c_rf_token, client_punch_token);
+    assert_eq!(c_target, public_relay);
 }
 
 
