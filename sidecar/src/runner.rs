@@ -362,7 +362,10 @@ pub async fn run_host_session(
                             let socket_clone = udp_socket.clone();
                             let cmd_tx_clone = ws_cmd_tx.clone();
                             let relay_rx = relay_tx.subscribe();
-                            let bind_port = config.bind_port;
+                            // Bind dynamic ephemeral ports (port 0) for each peer tunnel on the host
+                            // so local game engine receives traffic from distinct UDP source endpoints,
+                            // assigning Slots 1, 2, and 3 without address collision.
+                            let bind_port = 0u16;
                             let target_game_addr = config.target_game_addr;
                             let sub_event_tx = event_tx.clone();
                             let active_peers_clone = active_peers.clone();
